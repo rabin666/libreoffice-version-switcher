@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Build output: web UI (dist/ui), bundled CLI (dist/lovs.cjs), yao-pkg executables
+dist/
+release/
+.pkg-cache/
+
+# Local scratch / test data
+.tmp/
+coverage/
+.vite/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Downloaded installers, if kept next to the project
+*.msi
+*.paf.exe
+*.tar.gz
+
+# Editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
