@@ -5,18 +5,18 @@ describe('PATH entry helpers', () => {
   const isLo = (e) => e.includes('LibreOffice');
 
   it('puts the new dir first and drops other LibreOffice dirs', () => {
-    const res = withEntryAdded(['C:\\bin', 'D:\\LibreOffice_7\\program', 'C:\\tools'], 'D:\\LibreOffice_25\\program', { isLo });
+    const res = withEntryAdded(['C:\\bin', 'D:\\LibreOffice_7\\program', 'C:\\tools'], 'D:\\LibreOffice_25\\program', { isLibreOffice: isLo });
     expect(res.entries).toEqual(['D:\\LibreOffice_25\\program', 'C:\\bin', 'C:\\tools']);
     expect(res.removed).toEqual(['D:\\LibreOffice_7\\program']);
   });
 
   it('can keep other LibreOffice dirs', () => {
-    const res = withEntryAdded(['D:\\LibreOffice_7\\program'], 'D:\\LibreOffice_25\\program', { isLo, replaceLibreOffice: false });
+    const res = withEntryAdded(['D:\\LibreOffice_7\\program'], 'D:\\LibreOffice_25\\program', { isLibreOffice: isLo, replaceLibreOffice: false });
     expect(res.entries).toEqual(['D:\\LibreOffice_25\\program', 'D:\\LibreOffice_7\\program']);
   });
 
   it('does not duplicate an existing entry', () => {
-    const res = withEntryAdded(['C:\\bin', 'D:\\LO\\program'], 'D:\\LO\\program', { isLo: () => false });
+    const res = withEntryAdded(['C:\\bin', 'D:\\LO\\program'], 'D:\\LO\\program', { isLibreOffice: () => false });
     expect(res.entries).toEqual(['D:\\LO\\program', 'C:\\bin']);
   });
 

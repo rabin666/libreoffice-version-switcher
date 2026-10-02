@@ -3,27 +3,27 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { subshellPlan, toMsysPath } from '../utils/envcmd.js';
+import { subshellLaunchPlan, toMsysPath } from '../utils/shell.js';
 import { isWindows } from '../utils/platform.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lovs-subshell-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-describe('subshellPlan', () => {
+describe('subshellLaunchPlan', () => {
   it('applies the version after the start-up files for every shell', () => {
     const dir = isWindows ? 'D:\\LO\\program' : '/opt/lo/program';
-    const ps = subshellPlan('powershell', dir);
+    const ps = subshellLaunchPlan('powershell', dir);
     expect(ps.args.slice(0, 3)).toEqual(['-NoLogo', '-NoExit', '-Command']);
-    const cmd = subshellPlan('cmd', dir, { windows: true, env: {} });
+    const cmd = subshellLaunchPlan('cmd', dir, { windows: true, env: {} });
     expect(cmd).toMatchObject({ command: 'cmd.exe', verbatim: true });
     expect(cmd.args[0]).toBe('/K');
-    expect(subshellPlan('fish', dir).args[0]).toBe('--init-command');
+    expect(subshellLaunchPlan('fish', dir).args[0]).toBe('--init-command');
 
-    const bash = subshellPlan('bash', dir, { tmpDir: tmp, env: { SHELL: '/bin/bash' } });
+    const bash = subshellLaunchPlan('bash', dir, { tmpDir: tmp, env: { SHELL: '/bin/bash' } });
     const rc = Object.values(bash.files)[0];
     expect(rc.indexOf('.bashrc')).toBeLessThan(rc.indexOf('export PATH'));
 
-    const zsh = subshellPlan('bash', '/opt/lo/program', { tmpDir: tmp, windows: false, env: { SHELL: '/usr/bin/zsh', HOME: '/home/u' } });
+    const zsh = subshellLaunchPlan('bash', '/opt/lo/program', { tmpDir: tmp, windows: false, env: { SHELL: '/usr/bin/zsh', HOME: '/home/u' } });
     expect(zsh.env.ZDOTDIR).toBe(tmp);
     const zshrc = zsh.files[path.join(tmp, '.zshrc')];
     expect(zshrc.indexOf("'/home/u'/.zshrc")).toBeLessThan(zshrc.indexOf('export PATH'));
@@ -34,7 +34,7 @@ describe('subshellPlan', () => {
 // persistent default must not win over the selected version.
 const plan0 = (() => {
   try {
-    return subshellPlan('bash', tmp, { tmpDir: tmp });
+    return subshellLaunchPlan('bash', tmp, { tmpDir: tmp });
   } catch {
     return null;
   }
@@ -57,7 +57,7 @@ describe.runIf(bashAvailable)('lovs shell with a PATH-prepending .bashrc', () =>
     fs.writeFileSync(path.join(home, '.bashrc'), `case ":$PATH:" in *":${def}:"*) ;; *) PATH="${def}:$PATH" ;; esac\n`);
 
     const shellTmp = fs.mkdtempSync(path.join(tmp, 'sh-'));
-    const plan = subshellPlan('bash', selected, { tmpDir: shellTmp });
+    const plan = subshellLaunchPlan('bash', selected, { tmpDir: shellTmp });
     for (const [f, c] of Object.entries(plan.files)) fs.writeFileSync(f, c);
     const res = spawnSync(plan.command, [...plan.args, '-c', 'soffice'], {
       env: { ...process.env, HOME: home, ...plan.env },

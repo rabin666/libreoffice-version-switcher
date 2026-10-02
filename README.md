@@ -76,7 +76,7 @@ Running `lovs env 7.6` in a terminal prints the plain commands for every shell. 
 - **Activity**: live progress (speed, ETA, phases, log) with cancel
 - **Settings**: every config key, plus detected XDM / 7-Zip
 
-The server only listens on `127.0.0.1`, rejects foreign `Host` headers and requires a per-run session token on every API call. Other websites can't drive it.
+The server only listens on `127.0.0.1`, rejects foreign `Host` headers and requires a per-run session token on every API call. Other websites can't drive it. `lovs ui --host 0.0.0.0` makes it reachable from your network through this machine's own addresses or hostname. Anyone who can reach it can then use it, so only do this on a trusted network.
 
 ## How versions are installed
 
@@ -145,10 +145,12 @@ npm run pkg:linux    # Linux x64 + arm64
 
 ```
 index.js            entry point (CLI)
-cli/                command definitions and terminal output
-api/                web server, routes, background jobs
-utils/              core: archive listing, download, XDM, install, local scan, PATH, shell commands
-web_interface/      React + Vite UI (built into dist/ui)
+cli/                commander definitions (program.js) and handlers per area (commands/)
+api/                web server, router, route table, background jobs
+utils/              core: install/unpack/lock/ownership, local scan, archive, downloaders, PATH, shell
+web_interface/      React + Vite UI (components/<area>, hooks, lib; built into dist/ui)
 scripts/            esbuild bundle + dev runner
-test/               unit tests
+test/               vitest suites
 ```
+
+Architecture, flows (with diagrams), on-disk data, security model, conventions and how-tos for contributors are in [readme.help.md](readme.help.md).

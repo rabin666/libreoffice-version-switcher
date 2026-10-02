@@ -1,36 +1,36 @@
+// fetch() wrappers with timeouts and retries for the archive server.
+
+import { sleep } from './fsutil.js';
+
 const USER_AGENT = 'libreoffice-version-switcher (+https://github.com/rabin666/libreoffice-version-switcher)';
+const RETRIES = 3;
 
-export const defaultHeaders = { 'User-Agent': USER_AGENT };
-
-/** fetch() with a timeout that also honours an outer AbortSignal. */
-export async function fetchWithTimeout(url, { timeout = 30000, signal, headers, ...opts } = {}) {
+/** fetch() that times out after `timeout` ms and also honours an outer AbortSignal. */
+export async function fetchWithTimeout(url, { timeout = 30000, signal, headers, ...options } = {}) {
   const signals = [AbortSignal.timeout(timeout)];
   if (signal) signals.push(signal);
   return fetch(url, {
-    ...opts,
-    headers: { ...defaultHeaders, ...headers },
+    ...options,
+    headers: { 'User-Agent': USER_AGENT, ...headers },
     signal: AbortSignal.any(signals),
     redirect: 'follow',
   });
 }
 
-export async function fetchText(url, opts = {}) {
-  let lastErr;
-  for (let attempt = 0; attempt < 3; attempt++) {
+/** Response body as text. Retries transient failures; a 404 throws at once with `status: 404`. */
+export async function fetchText(url, options = {}) {
+  let lastError;
+  for (let attempt = 0; attempt < RETRIES; attempt++) {
     try {
-      const res = await fetchWithTimeout(url, opts);
-      if (res.status === 404) {
-        const err = new Error(`Not found: ${url}`);
-        err.status = 404;
-        throw err;
-      }
-      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-      return await res.text();
+      const response = await fetchWithTimeout(url, options);
+      if (response.status === 404) throw Object.assign(new Error(`Not found: ${url}`), { status: 404 });
+      if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
+      return await response.text();
     } catch (err) {
-      lastErr = err;
-      if (err.status === 404 || opts.signal?.aborted) throw err;
-      await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+      lastError = err;
+      if (err.status === 404 || options.signal?.aborted) throw err;
+      await sleep(500 * (attempt + 1));
     }
   }
-  throw lastErr;
+  throw lastError;
 }

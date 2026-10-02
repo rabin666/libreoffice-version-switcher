@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { compareVersions, isPrerelease, isVersionString, matchesSpec, resolveSpec, seriesOf, shortVersion } from '../utils/versions.js';
+import { compareVersions, isPrerelease, isVersionString, matchesSpec, bestMatchingVersion, seriesOf, shortVersion } from '../utils/versions.js';
 
 describe('versions', () => {
   it('recognises archive version strings', () => {
@@ -25,11 +25,11 @@ describe('versions', () => {
 
   it('resolves a spec to the newest final build', () => {
     const v = ['7.6.7.2', '7.6.7.1', '7.6.5.2', '26.8.0.0.beta1', '26.2.6.3'];
-    expect(resolveSpec(v, '7.6')).toBe('7.6.7.2');
-    expect(resolveSpec(v, '7.6.5')).toBe('7.6.5.2');
-    expect(resolveSpec(v, 'latest')).toBe('26.2.6.3');
-    expect(resolveSpec(v, '26.8.0.0.beta1')).toBe('26.8.0.0.beta1');
-    expect(resolveSpec(v, '9.9')).toBeNull();
+    expect(bestMatchingVersion(v, '7.6')).toBe('7.6.7.2');
+    expect(bestMatchingVersion(v, '7.6.5')).toBe('7.6.5.2');
+    expect(bestMatchingVersion(v, 'latest')).toBe('26.2.6.3');
+    expect(bestMatchingVersion(v, '26.8.0.0.beta1')).toBe('26.8.0.0.beta1');
+    expect(bestMatchingVersion(v, '9.9')).toBeNull();
   });
 
   it('derives series and short versions', () => {

@@ -1,100 +1,99 @@
+// Background jobs (installs) with progress, logs and cancellation. Emits
+// 'update' with the job's public state on every change, and 'removed'.
+
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 
-/**
- * Long-running background work (installs) with progress, logs and
- * cancellation. Emits 'update' with the public job object on every change.
- */
+const MAX_LOG_LINES = 200;
+
 export class JobManager extends EventEmitter {
+  // id -> {key, controller, state}; only `state` is ever sent to clients.
   #jobs = new Map();
 
   list() {
-    return [...this.#jobs.values()].map((j) => j.public).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    return [...this.#jobs.values()].map((job) => job.state).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
   get(id) {
-    return this.#jobs.get(id)?.public ?? null;
+    return this.#jobs.get(id)?.state ?? null;
   }
 
+  /** The running job registered under `key`, if any (used to de-duplicate requests). */
   findActive(key) {
-    return [...this.#jobs.values()].find((j) => j.key === key && j.public.status === 'running')?.public ?? null;
+    return [...this.#jobs.values()].find((job) => job.key === key && job.state.status === 'running')?.state ?? null;
   }
 
-  /** Start `runner({signal, phase, progress, log})` as a job. */
-  start({ type, title, key, meta = {} }, runner) {
+  /** Run `task({signal, phase, progress, log})` as a job; returns its state immediately. */
+  start({ type, title, key, meta = {} }, task) {
     const controller = new AbortController();
-    const job = {
-      key,
-      controller,
-      public: {
-        id: crypto.randomUUID(),
-        type,
-        title,
-        meta,
-        status: 'running',
-        phase: 'starting',
-        detail: '',
-        progress: null,
-        logs: [],
-        error: null,
-        result: null,
-        createdAt: new Date().toISOString(),
-        finishedAt: null,
-      },
+    const state = {
+      id: crypto.randomUUID(),
+      type,
+      title,
+      meta,
+      status: 'running',
+      phase: 'starting',
+      detail: '',
+      progress: null,
+      logs: [],
+      error: null,
+      result: null,
+      createdAt: new Date().toISOString(),
+      finishedAt: null,
     };
-    this.#jobs.set(job.public.id, job);
-    const pub = job.public;
-    const changed = () => this.emit('update', pub);
+    this.#jobs.set(state.id, { key, controller, state });
+    const publish = () => this.emit('update', state);
 
-    const ctx = {
+    const context = {
       signal: controller.signal,
       phase: (phase, detail = '') => {
-        pub.phase = phase;
-        pub.detail = detail;
-        if (phase !== 'download') pub.progress = null;
-        changed();
+        state.phase = phase;
+        state.detail = detail;
+        if (phase !== 'download') state.progress = null;
+        publish();
       },
-      progress: (p) => {
-        pub.progress = p;
-        changed();
+      progress: (progress) => {
+        state.progress = progress;
+        publish();
       },
-      log: (msg) => {
-        pub.logs.push({ at: new Date().toISOString(), msg });
-        if (pub.logs.length > 200) pub.logs.shift();
-        changed();
+      log: (message) => {
+        state.logs.push({ at: new Date().toISOString(), msg: message });
+        if (state.logs.length > MAX_LOG_LINES) state.logs.shift();
+        publish();
       },
     };
 
-    changed();
+    publish();
     Promise.resolve()
-      .then(() => runner(ctx))
+      .then(() => task(context))
       .then(
         (result) => {
-          pub.status = 'done';
-          pub.result = result ?? null;
+          state.status = 'done';
+          state.result = result ?? null;
         },
         (err) => {
-          pub.status = controller.signal.aborted ? 'cancelled' : 'error';
-          pub.error = err?.message ?? String(err);
+          state.status = controller.signal.aborted ? 'cancelled' : 'error';
+          state.error = err?.message ?? String(err);
         },
       )
       .finally(() => {
-        pub.finishedAt = new Date().toISOString();
-        changed();
+        state.finishedAt = new Date().toISOString();
+        publish();
       });
-    return pub;
+    return state;
   }
 
   cancel(id) {
     const job = this.#jobs.get(id);
-    if (!job || job.public.status !== 'running') return false;
+    if (!job || job.state.status !== 'running') return false;
     job.controller.abort();
     return true;
   }
 
+  /** Forget a finished job. */
   dismiss(id) {
     const job = this.#jobs.get(id);
-    if (!job || job.public.status === 'running') return false;
+    if (!job || job.state.status === 'running') return false;
     this.#jobs.delete(id);
     this.emit('removed', id);
     return true;

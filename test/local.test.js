@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { resolveLocal, scanLocalInstalls, versionFromPath } from '../utils/local.js';
+import { matchInstall, scanLocalInstalls, versionFromPath } from '../utils/local.js';
 import { sofficeName } from '../utils/platform.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lovs-test-'));
@@ -33,9 +33,9 @@ describe('local scan', () => {
 
   it('resolves version prefixes to the newest match', async () => {
     const list = await scanLocalInstalls({ installDir, scanDirs: [scanDir] }, { probe: false });
-    expect(resolveLocal(list, '7.6').version).toBe('7.6.7.2');
-    expect(resolveLocal(list, '7.6.5').version).toBe('7.6.5.2');
-    expect(() => resolveLocal(list, '6.4')).toThrow(/No local install/);
+    expect(matchInstall(list, '7.6').version).toBe('7.6.7.2');
+    expect(matchInstall(list, '7.6.5').version).toBe('7.6.5.2');
+    expect(() => matchInstall(list, '6.4')).toThrow(/No local install/);
   });
 
   it('reads versions from folder names', () => {

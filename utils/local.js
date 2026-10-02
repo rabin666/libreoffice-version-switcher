@@ -1,281 +1,185 @@
+// LibreOffice installs on this machine: finding them, describing them, and
+// resolving what a user typed ("7.6", an id, a folder) to exactly one.
+
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { cacheDir } from './config.js';
+import { normalizePath, readIni, readJson, writeJsonQuietly } from './fsutil.js';
+import { isOwnedInstall, portableRootOf, readMetadata } from './ownership.js';
 import { isWindows, sofficeName } from './platform.js';
+import { hasIsolatedProfile } from './profile.js';
 import { compareVersions, isVersionString, matchesSpec, numericParts } from './versions.js';
 
-export const METADATA_FILE = '.lovs.json';
-
-const MARKER_FILES = ['bootstrap.ini', 'bootstraprc', 'fundamental.ini', 'fundamentalrc', 'version.ini', 'versionrc'];
-
+const SCAN_DEPTH = 6;
+const PROGRAM_DIR_MARKERS = ['bootstrap.ini', 'bootstraprc', 'fundamental.ini', 'fundamentalrc', 'version.ini', 'versionrc'];
 // Folders that never contain an install root; skipping them keeps scans fast.
-const SKIP_DIRS = new Set(
-  [
-    'node_modules', 'data', 'share', 'help', 'readmes', 'presets', 'fonts', 'manual', 'java',
-    'defaultdata', 'other', 'windows', '$recycle.bin', 'system volume information', 'sdk',
-  ],
-);
+const SKIPPED_DIRS = new Set([
+  'node_modules', 'data', 'share', 'help', 'readmes', 'presets', 'fonts', 'manual', 'java',
+  'defaultdata', 'other', 'windows', '$recycle.bin', 'system volume information', 'sdk',
+]);
+// When several installs match a version, prefer lovs-managed ones.
+const SOURCE_PRIORITY = { managed: 0, scanned: 1, system: 2 };
 
-const MAX_DEPTH = 6;
-
-/** A LibreOffice "program" folder: holds soffice plus one of its ini/rc files. */
+/** A LibreOffice "program" folder: soffice plus one of its ini/rc files. */
 export function isProgramDir(dir) {
   try {
     if (!fs.statSync(path.join(dir, sofficeName)).isFile()) return false;
   } catch {
     return false;
   }
-  return MARKER_FILES.some((f) => fs.existsSync(path.join(dir, f)));
+  return PROGRAM_DIR_MARKERS.some((marker) => fs.existsSync(path.join(dir, marker)));
 }
 
-export function normalizePath(p) {
-  let out = path.resolve(p).replace(/[\\/]+$/, '');
-  if (isWindows) out = out.toLowerCase();
-  return out;
-}
-
-export function isInside(child, parent) {
-  if (!parent) return false;
-  const c = normalizePath(child);
-  const p = normalizePath(parent);
-  return c === p || c.startsWith(p + path.sep);
-}
-
-/** Path with every symlink/junction resolved, or null when it doesn't exist. */
-export function realPath(p) {
+function isDirectory(entry, fullPath) {
+  if (!entry.isSymbolicLink()) return entry.isDirectory();
   try {
-    return fs.realpathSync.native(p);
+    return fs.statSync(fullPath).isDirectory();
   } catch {
-    return null;
+    return false;
   }
 }
 
-/** Ownership marker written by lovs after a successful install. */
-export function readMetadata(root) {
-  const meta = readJson(path.join(root, METADATA_FILE));
-  return meta && typeof meta.method === 'string' && typeof meta.version === 'string' ? meta : null;
-}
-
-/** UserInstallation from program/bootstrap.ini (Windows) or bootstraprc (Linux). */
-export function readUserInstallation(programDir) {
-  for (const f of ['bootstrap.ini', 'bootstraprc']) {
-    const file = path.join(programDir, f);
-    if (fs.existsSync(file)) return readIni(file).UserInstallation ?? null;
-  }
-  return null;
-}
-
-/**
- * True when the profile lives next to the install ($ORIGIN-relative) rather
- * than in the shared %APPDATA% / ~/.config location.
- */
-export function hasIsolatedProfile(programDir) {
-  return /^\$ORIGIN(\/|$)/.test(readUserInstallation(programDir) ?? '');
-}
-
-/**
- * The folder lovs created for this install (its real path, links resolved),
- * or null when lovs doesn't own it. Owned means: lovs metadata at `root`,
- * and the install's top folder (the portable folder, or `root` itself) is
- * really a direct child of the install folder with `root` inside it. This
- * is the only folder uninstall/reinstall will ever delete.
- */
-export function ownedInstallDir(root, installDir) {
-  if (!installDir || !readMetadata(root)) return null;
-  const realTop = realPath(portableRootOf(root) ?? root);
-  const realInstallDir = realPath(installDir);
-  const realRoot = realPath(root);
-  if (!realTop || !realInstallDir || !realRoot) return null;
-  if (normalizePath(path.dirname(realTop)) !== normalizePath(realInstallDir)) return null;
-  return isInside(realRoot, realTop) ? realTop : null;
-}
-
-export function isOwnedInstall(root, installDir) {
-  return ownedInstallDir(root, installDir) !== null;
-}
-
-function findInstallRoots(dir, depth, out) {
+/** Install roots (folders containing program/soffice) up to `depth` levels below `dir`. */
+export function findInstallRootsIn(dir, depth = SCAN_DEPTH, found = []) {
   if (isProgramDir(path.join(dir, 'program'))) {
-    out.push(dir);
-    return;
+    found.push(dir);
+    return found;
   }
-  if (depth <= 0) return;
+  if (depth <= 0) return found;
   let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch {
-    return;
+    return found;
   }
-  for (const e of entries) {
-    if (e.name.startsWith('.') || SKIP_DIRS.has(e.name.toLowerCase())) continue;
-    const full = path.join(dir, e.name);
-    let isDir = e.isDirectory();
-    if (e.isSymbolicLink()) {
-      try {
-        isDir = fs.statSync(full).isDirectory();
-      } catch {
-        isDir = false;
-      }
-    }
-    if (isDir) findInstallRoots(full, depth - 1, out);
+  for (const entry of entries) {
+    // Dot folders include lovs' own staging, backup and lock files.
+    if (entry.name.startsWith('.') || SKIPPED_DIRS.has(entry.name.toLowerCase())) continue;
+    const fullPath = path.join(dir, entry.name);
+    if (isDirectory(entry, fullPath)) findInstallRootsIn(fullPath, depth - 1, found);
   }
-}
-
-/** Install roots (folders that contain program/soffice) below `dir`. */
-export function findInstallRootsIn(dir, depth = MAX_DEPTH) {
-  const out = [];
-  findInstallRoots(dir, depth, out);
-  return out;
-}
-
-export function readIni(file) {
-  const out = {};
-  try {
-    for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
-      const m = line.match(/^\s*([^=;#[\s][^=]*?)\s*=\s*(.*?)\s*$/);
-      if (m && !(m[1] in out)) out[m[1]] = m[2];
-    }
-  } catch {
-    // unreadable -> empty
-  }
-  return out;
-}
-
-function readJson(file) {
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-/** Portable builds keep LibreOffice in <portable>/App/libreoffice. */
-function portableRootOf(root) {
-  const parts = path.resolve(root).split(path.sep);
-  const n = parts.length;
-  if (n >= 3 && parts[n - 1].toLowerCase() === 'libreoffice' && parts[n - 2].toLowerCase() === 'app') {
-    return parts.slice(0, n - 2).join(path.sep);
-  }
-  return null;
+  return found;
 }
 
 /** Version from folder names such as "LibreOffice_25.2.7.2" or "/opt/libreoffice25.2". */
-export function versionFromPath(p) {
-  const parts = path.resolve(p).split(path.sep).reverse().slice(0, 4);
-  for (const part of parts) {
-    const m = part.match(/(\d+\.\d+(?:\.\d+){0,2})/);
-    if (m && isVersionString(m[1])) return m[1];
+export function versionFromPath(target) {
+  const nearestFolders = path.resolve(target).split(path.sep).reverse().slice(0, 4);
+  for (const folder of nearestFolders) {
+    const match = folder.match(/(\d+\.\d+(?:\.\d+){0,2})/);
+    if (match && isVersionString(match[1])) return match[1];
   }
   return null;
 }
 
-// --- `soffice --version` probing (Linux installs carry no version file) ---
-
-const probeCacheFile = () => path.join(cacheDir(), 'probed-versions.json');
-
-function probeVersion(soffice) {
-  // soffice.exe is a GUI program on Windows; soffice.com prints to the console.
-  const exe = isWindows ? soffice.replace(/\.exe$/i, '.com') : soffice;
-  return new Promise((resolve) => {
-    execFile(exe, ['--version'], { timeout: 20000, windowsHide: true }, (err, stdout) => {
-      const m = String(stdout || '').match(/LibreOffice(?:Dev)?\s+(\d+\.\d+\.\d+\.\d+)/);
-      resolve(m ? m[1] : null);
-    });
-  });
-}
-
-async function probeVersions(installs) {
-  const cache = readJson(probeCacheFile()) ?? {};
-  let changed = false;
-  await Promise.all(
-    installs.map(async (inst) => {
-      let mtime;
-      try {
-        mtime = fs.statSync(inst.soffice).mtimeMs;
-      } catch {
-        return;
-      }
-      const key = normalizePath(inst.root);
-      let version = cache[key]?.mtime === mtime ? cache[key].version : undefined;
-      if (version === undefined) {
-        version = await probeVersion(inst.soffice);
-        cache[key] = { mtime, version };
-        changed = true;
-      }
-      if (version) {
-        inst.version = version;
-        inst.versionSource = 'soffice --version';
-      }
-    }),
-  );
-  if (changed) {
-    try {
-      fs.mkdirSync(cacheDir(), { recursive: true });
-      fs.writeFileSync(probeCacheFile(), JSON.stringify(cache));
-    } catch {
-      // best effort
-    }
+/** {version, source} from lovs metadata, version.ini/versionrc, or the portable appinfo.ini. */
+function readRecordedVersion(programDir, metadata, portableRoot) {
+  if (metadata?.version) return { version: metadata.version, source: 'metadata' };
+  for (const file of ['version.ini', 'versionrc']) {
+    const version = readIni(path.join(programDir, file)).MsiProductVersion;
+    if (version && isVersionString(version)) return { version, source: file };
   }
+  if (portableRoot) {
+    const version = readIni(path.join(portableRoot, 'App', 'AppInfo', 'appinfo.ini')).DisplayVersion;
+    if (version && isVersionString(version)) return { version, source: 'appinfo.ini' };
+  }
+  return { version: null, source: null };
 }
 
+function kindOf(metadata, portableRoot, source) {
+  if (metadata?.method) return metadata.method;
+  if (portableRoot) return 'portable';
+  return source === 'system' ? 'system' : 'extracted';
+}
+
+/**
+ * Everything the CLI and UI show about one install. `source` is where it was
+ * found; it becomes 'managed' only when lovs really owns it.
+ */
 function describeInstall(root, source, installDir) {
   const programDir = path.join(root, 'program');
-  const meta = readMetadata(root);
-  // Only installs lovs created count as managed; anything else found in the
-  // install folder is treated like a scan-folder install (never deleted).
-  const owned = isOwnedInstall(root, installDir);
-  if (source === 'managed' && !owned) source = 'scanned';
-  else if (owned) source = 'managed';
+  const metadata = readMetadata(root);
   const portableRoot = portableRootOf(root);
-  let version = null;
-  let versionSource = null;
-
-  if (meta?.version) {
-    version = meta.version;
-    versionSource = 'metadata';
-  }
-  if (!version) {
-    for (const f of ['version.ini', 'versionrc']) {
-      const v = readIni(path.join(programDir, f)).MsiProductVersion;
-      if (v && isVersionString(v)) {
-        version = v;
-        versionSource = f;
-        break;
-      }
-    }
-  }
-  if (!version && portableRoot) {
-    const v = readIni(path.join(portableRoot, 'App', 'AppInfo', 'appinfo.ini')).DisplayVersion;
-    if (v && isVersionString(v)) {
-      version = v;
-      versionSource = 'appinfo.ini';
-    }
-  }
+  const owned = isOwnedInstall(root, installDir);
+  const effectiveSource = owned ? 'managed' : source === 'managed' ? 'scanned' : source;
+  const recorded = readRecordedVersion(programDir, metadata, portableRoot);
 
   return {
     id: crypto.createHash('sha1').update(normalizePath(root)).digest('hex').slice(0, 10),
-    version,
-    versionSource,
+    version: recorded.version,
+    versionSource: recorded.source,
     label: path.basename(portableRoot ?? root),
     root,
     programDir,
     soffice: path.join(programDir, sofficeName),
     portableRoot,
-    kind: meta?.method ?? (portableRoot ? 'portable' : source === 'system' ? 'system' : 'extracted'),
-    source,
-    managed: source === 'managed',
+    kind: kindOf(metadata, portableRoot, effectiveSource),
+    source: effectiveSource,
+    managed: owned,
     isolatedProfile: hasIsolatedProfile(programDir),
-    installedAt: meta?.installedAt ?? null,
+    installedAt: metadata?.installedAt ?? null,
   };
 }
 
-function systemRoots() {
+function fillVersionFromPath(install) {
+  if (install.version) return;
+  install.version = versionFromPath(install.root);
+  if (install.version) install.versionSource = 'folder name';
+}
+
+// --- `soffice --version` probing: newer builds record only 3 version parts ---
+
+const probeCacheFile = () => path.join(cacheDir(), 'probed-versions.json');
+
+function probeVersion(soffice) {
+  // soffice.exe is a GUI program on Windows; soffice.com writes to the console.
+  const executable = isWindows ? soffice.replace(/\.exe$/i, '.com') : soffice;
+  return new Promise((resolve) => {
+    execFile(executable, ['--version'], { timeout: 20000, windowsHide: true }, (err, stdout) => {
+      const match = String(stdout || '').match(/LibreOffice(?:Dev)?\s+(\d+\.\d+\.\d+\.\d+)/);
+      resolve(match ? match[1] : null);
+    });
+  });
+}
+
+/** Fill in full versions by running soffice; cached per install and soffice mtime. */
+async function probeVersions(installs) {
+  const cache = readJson(probeCacheFile()) ?? {};
+  let cacheChanged = false;
+  await Promise.all(
+    installs.map(async (install) => {
+      let modifiedAt;
+      try {
+        modifiedAt = fs.statSync(install.soffice).mtimeMs;
+      } catch {
+        return;
+      }
+      const key = normalizePath(install.root);
+      let version = cache[key]?.mtime === modifiedAt ? cache[key].version : undefined;
+      if (version === undefined) {
+        version = await probeVersion(install.soffice);
+        cache[key] = { mtime: modifiedAt, version };
+        cacheChanged = true;
+      }
+      if (version) {
+        install.version = version;
+        install.versionSource = 'soffice --version';
+      }
+    }),
+  );
+  if (cacheChanged) writeJsonQuietly(probeCacheFile(), cache);
+}
+
+function needsProbe(install) {
+  return !install.version || (install.versionSource !== 'metadata' && numericParts(install.version).length < 4);
+}
+
+function systemLocations() {
   if (isWindows) {
     return [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.ProgramW6432]
       .filter(Boolean)
-      .map((d) => ({ dir: path.join(d, 'LibreOffice'), depth: 0 }));
+      .map((programFiles) => ({ dir: path.join(programFiles, 'LibreOffice'), depth: 0 }));
   }
   return [
     { dir: '/opt', depth: 1 },
@@ -286,130 +190,119 @@ function systemRoots() {
   ];
 }
 
+function realKey(root) {
+  try {
+    return normalizePath(fs.realpathSync(root));
+  } catch {
+    return normalizePath(root);
+  }
+}
+
 /**
- * Find every LibreOffice install in the install folder, the extra scan
- * folders and the usual system locations. Newest version first.
+ * Every install in installDir, the scan folders and the usual system
+ * locations, newest first. `probe: false` skips running soffice (faster, but
+ * some versions stay 3-part).
  */
 export async function scanLocalInstalls(config, { probe = true } = {}) {
-  const roots = [
-    { dir: config.installDir, depth: MAX_DEPTH, source: 'managed' },
-    ...config.scanDirs.map((dir) => ({ dir, depth: MAX_DEPTH, source: 'scanned' })),
-    ...systemRoots().map((r) => ({ ...r, source: 'system' })),
+  const locations = [
+    { dir: config.installDir, depth: SCAN_DEPTH, source: 'managed' },
+    ...config.scanDirs.map((dir) => ({ dir, depth: SCAN_DEPTH, source: 'scanned' })),
+    ...systemLocations().map((location) => ({ ...location, source: 'system' })),
   ];
-  const seen = new Set();
+  const seenRealPaths = new Set();
   const installs = [];
-  for (const { dir, depth, source } of roots) {
+  for (const { dir, depth, source } of locations) {
     if (!dir || !fs.existsSync(dir)) continue;
-    const found = [];
-    findInstallRoots(dir, depth, found);
-    for (const root of found) {
-      let key;
-      try {
-        key = normalizePath(fs.realpathSync(root));
-      } catch {
-        key = normalizePath(root);
-      }
-      if (seen.has(key)) continue;
-      seen.add(key);
+    for (const root of findInstallRootsIn(dir, depth)) {
+      const key = realKey(root);
+      if (seenRealPaths.has(key)) continue;
+      seenRealPaths.add(key);
       installs.push(describeInstall(root, source, config.installDir));
     }
   }
 
-  // Newer builds don't record the full 4-part version in version.ini, so
-  // ask soffice itself (cached per install, so only the first scan is slow).
-  const incomplete = installs.filter((i) => !i.version || (i.versionSource !== 'metadata' && numericParts(i.version).length < 4));
-  if (probe && incomplete.length) await probeVersions(incomplete);
-  for (const inst of installs) {
-    if (!inst.version) {
-      inst.version = versionFromPath(inst.root);
-      if (inst.version) inst.versionSource = 'folder name';
-    }
-  }
-
+  const unprobed = installs.filter(needsProbe);
+  if (probe && unprobed.length) await probeVersions(unprobed);
+  installs.forEach(fillVersionFromPath);
   return installs.sort((a, b) => compareVersions(b.version ?? '0', a.version ?? '0'));
 }
 
 /**
- * Describe an install from a path given directly by the user: the install
- * root, its program folder, or a portable folder. Returns null otherwise.
+ * Describe the install at a path the user gave: the install root, its
+ * program folder, or a portable folder. null when it isn't one.
  */
-export function installFromPath(p, config) {
-  const abs = path.resolve(p);
+export function installFromPath(target, config) {
+  const absolute = path.resolve(target);
   let root = null;
-  if (isProgramDir(path.join(abs, 'program'))) root = abs;
-  else if (isProgramDir(abs)) root = path.dirname(abs);
-  else if (isProgramDir(path.join(abs, 'App', 'libreoffice', 'program'))) root = path.join(abs, 'App', 'libreoffice');
+  if (isProgramDir(path.join(absolute, 'program'))) root = absolute;
+  else if (isProgramDir(absolute)) root = path.dirname(absolute);
+  else if (isProgramDir(path.join(absolute, 'App', 'libreoffice', 'program'))) root = path.join(absolute, 'App', 'libreoffice');
   if (!root) return null;
-  const inst = describeInstall(root, 'scanned', config?.installDir);
-  if (!inst.version) {
-    inst.version = versionFromPath(root);
-    if (inst.version) inst.versionSource = 'folder name';
-  }
-  return inst;
+  const install = describeInstall(root, 'scanned', config?.installDir);
+  fillVersionFromPath(install);
+  return install;
 }
 
-const SOURCE_RANK = { managed: 0, scanned: 1, system: 2 };
+function matchesPath(install, target) {
+  return [install.root, install.programDir, install.portableRoot].filter(Boolean).some((candidate) => normalizePath(candidate) === target);
+}
 
 /**
- * Resolve a user spec (id, path, or version prefix like "7.6" / "25.2.7")
- * to one local install. Throws with a helpful message when nothing or too
- * much matches.
+ * The one install in `installs` that `spec` (id, path, or version prefix
+ * like "7.6") selects. Throws a helpful error when none or several match.
  */
-export function resolveLocal(installs, spec) {
+export function matchInstall(installs, spec) {
   if (!spec) throw new Error('Specify a version, id or path');
-  const byId = installs.find((i) => i.id === spec);
+  const byId = installs.find((install) => install.id === spec);
   if (byId) return byId;
 
   if (/[\\/]/.test(spec) || fs.existsSync(spec)) {
     const target = normalizePath(spec);
-    const byPath = installs.find((i) =>
-      [i.root, i.programDir, i.portableRoot].filter(Boolean).some((p) => normalizePath(p) === target),
-    );
+    const byPath = installs.find((install) => matchesPath(install, target));
     if (byPath) return byPath;
   }
 
-  const exact = installs.filter((i) => i.version === spec);
-  const matches = exact.length ? exact : installs.filter((i) => i.version && matchesSpec(i.version, spec));
-  if (!matches.length) {
-    const have = installs.map((i) => i.version).filter(Boolean).join(', ') || 'none';
-    throw new Error(`No local install matches "${spec}". Installed: ${have}`);
+  const exact = installs.filter((install) => install.version === spec);
+  const candidates = exact.length ? exact : installs.filter((install) => install.version && matchesSpec(install.version, spec));
+  if (!candidates.length) {
+    const available = installs.map((install) => install.version).filter(Boolean).join(', ') || 'none';
+    throw new Error(`No local install matches "${spec}". Installed: ${available}`);
   }
-  matches.sort((a, b) => compareVersions(b.version, a.version) || SOURCE_RANK[a.source] - SOURCE_RANK[b.source]);
-  const best = matches[0];
-  const tied = matches.filter((m) => m.version === best.version && m.source === best.source);
+  candidates.sort((a, b) => compareVersions(b.version, a.version) || SOURCE_PRIORITY[a.source] - SOURCE_PRIORITY[b.source]);
+  const best = candidates[0];
+  const tied = candidates.filter((candidate) => candidate.version === best.version && candidate.source === best.source);
   if (tied.length > 1) {
-    const list = tied.map((t) => `  ${t.id}  ${t.root}`).join('\n');
-    throw new Error(`"${spec}" matches several installs of ${best.version}; use an id or path:\n${list}`);
+    const choices = tied.map((candidate) => `  ${candidate.id}  ${candidate.root}`).join('\n');
+    throw new Error(`"${spec}" matches several installs of ${best.version}; use an id or path:\n${choices}`);
   }
   return best;
 }
 
-/**
- * The argument that makes resolveInstall() pick exactly `inst` again, given
- * the same scan result: its version when that is unambiguous, its id when
- * the scan finds it, otherwise its absolute folder (an install given by path
- * that no scan folder covers). Raw text: quote it for the target shell.
- */
-export function selectorFor(inst, installs) {
-  if (inst.version) {
-    try {
-      if (resolveLocal(installs, inst.version).id === inst.id) return inst.version;
-    } catch {
-      // ambiguous, or the scan doesn't know this install
-    }
-  }
-  if (installs.some((i) => i.id === inst.id)) return inst.id;
-  return path.resolve(inst.portableRoot ?? inst.root);
-}
-
-/** Scan, then resolve `spec`; falls back to treating `spec` as a folder path. */
+/** Scan (unless `installs` is given) and match `spec`; a folder no scan covers also works. */
 export async function resolveInstall(config, spec, installs) {
   installs ??= await scanLocalInstalls(config);
   try {
-    return resolveLocal(installs, spec);
+    return matchInstall(installs, spec);
   } catch (err) {
-    const direct = fs.existsSync(spec) ? installFromPath(spec, config) : null;
-    if (direct) return direct;
+    const atPath = fs.existsSync(spec) ? installFromPath(spec, config) : null;
+    if (atPath) return atPath;
     throw err;
   }
+}
+
+/**
+ * The argument that makes resolveInstall() select `install` again from the
+ * same scan: its version if unambiguous, else its id if scanned, else its
+ * absolute folder. Unquoted; quote it for the target shell.
+ */
+export function selectorFor(install, installs) {
+  if (install.version) {
+    try {
+      if (matchInstall(installs, install.version).id === install.id) return install.version;
+    } catch {
+      // ambiguous, or not in this scan
+    }
+  }
+  if (installs.some((candidate) => candidate.id === install.id)) return install.id;
+  return path.resolve(install.portableRoot ?? install.root);
 }

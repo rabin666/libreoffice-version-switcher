@@ -1,20 +1,29 @@
+// Built-in downloader: parallel HTTP range requests with retries, size and
+// SHA-256 verification, and re-use of a matching earlier download.
+
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { sleep } from './fsutil.js';
 import { fetchWithTimeout } from './http.js';
 
 const MB = 1024 * 1024;
+const PROGRESS_INTERVAL_MS = 250;
+const SPEED_WINDOW_MS = 5000;
+const RANGE_RETRIES = 5;
+// Below this, one connection is as fast as several.
+const SEGMENTED_MIN_BYTES = 16 * MB;
 
-/** HEAD request: final URL after redirects, size and range support. */
-export async function probe(url, signal) {
-  const res = await fetchWithTimeout(url, { method: 'HEAD', signal, timeout: 30000 });
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-  const len = Number(res.headers.get('content-length'));
+/** HEAD request: final URL after redirects, size, and whether ranges are supported. */
+export async function probeUrl(url, signal) {
+  const response = await fetchWithTimeout(url, { method: 'HEAD', signal, timeout: 30000 });
+  if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
+  const length = Number(response.headers.get('content-length'));
   return {
-    finalUrl: res.url || url,
-    size: Number.isFinite(len) && len > 0 ? len : null,
-    acceptRanges: (res.headers.get('accept-ranges') || '').toLowerCase() === 'bytes',
+    finalUrl: response.url || url,
+    size: Number.isFinite(length) && length > 0 ? length : null,
+    acceptRanges: (response.headers.get('accept-ranges') || '').toLowerCase() === 'bytes',
   };
 }
 
@@ -24,105 +33,111 @@ export async function hashFile(file) {
   return hash.digest('hex');
 }
 
-/** Aggregates byte counts from many workers and reports at most every 250 ms. */
+/** Sums bytes from all connections; reports {downloaded, total, speed} at most every 250 ms. */
 export function progressTracker(total, onProgress) {
   let downloaded = 0;
-  let lastEmit = 0;
-  const samples = [];
-  const emit = (force) => {
+  let lastReport = 0;
+  const samples = []; // [time, bytes] over the last few seconds, for the speed
+  const report = (force) => {
     const now = Date.now();
-    if (!force && now - lastEmit < 250) return;
-    lastEmit = now;
+    if (!force && now - lastReport < PROGRESS_INTERVAL_MS) return;
+    lastReport = now;
     samples.push([now, downloaded]);
-    while (samples.length > 1 && now - samples[0][0] > 5000) samples.shift();
-    const [t0, b0] = samples[0];
-    const speed = now > t0 ? ((downloaded - b0) * 1000) / (now - t0) : 0;
+    while (samples.length > 1 && now - samples[0][0] > SPEED_WINDOW_MS) samples.shift();
+    const [sampleTime, sampleBytes] = samples[0];
+    const speed = now > sampleTime ? ((downloaded - sampleBytes) * 1000) / (now - sampleTime) : 0;
     onProgress?.({ downloaded, total, speed });
   };
   return {
-    add(n) {
-      downloaded += n;
-      emit(false);
+    add(bytes) {
+      downloaded += bytes;
+      report(false);
     },
-    done: () => emit(true),
-    get downloaded() {
-      return downloaded;
-    },
+    finish: () => report(true),
   };
 }
 
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function downloadRange(url, fh, start, end, signal, tracker) {
-  let pos = start;
+/** Download bytes [start, end] into `fileHandle`, resuming after dropped connections. */
+async function downloadRange(url, fileHandle, start, end, signal, tracker) {
+  let position = start;
   for (let attempt = 0; ; attempt++) {
     try {
-      const res = await fetchWithTimeout(url, {
-        headers: { Range: `bytes=${pos}-${end}` },
-        signal,
-        timeout: 10 * 60 * 1000,
-      });
-      if (res.status !== 206) throw new Error(`Server ignored range request (HTTP ${res.status})`);
-      for await (const chunk of res.body) {
-        const len = Math.min(chunk.length, end + 1 - pos);
-        if (len <= 0) break;
-        await fh.write(chunk, 0, len, pos);
-        pos += len;
-        tracker.add(len);
+      const response = await fetchWithTimeout(url, { headers: { Range: `bytes=${position}-${end}` }, signal, timeout: 10 * 60 * 1000 });
+      if (response.status !== 206) throw new Error(`Server ignored range request (HTTP ${response.status})`);
+      for await (const chunk of response.body) {
+        const length = Math.min(chunk.length, end + 1 - position);
+        if (length <= 0) break;
+        await fileHandle.write(chunk, 0, length, position);
+        position += length;
+        tracker.add(length);
       }
-      if (pos > end) return;
+      if (position > end) return;
       throw new Error('Connection closed early');
     } catch (err) {
-      if (signal?.aborted || attempt >= 5) throw err;
-      await wait(1000 * (attempt + 1));
+      if (signal?.aborted || attempt >= RANGE_RETRIES) throw err;
+      await sleep(1000 * (attempt + 1));
     }
   }
 }
 
 async function downloadSegmented(url, file, total, connections, signal, tracker) {
-  const fh = await fsp.open(file, 'w');
+  const fileHandle = await fsp.open(file, 'w');
   try {
-    await fh.truncate(total);
-    // Small pieces handed out from a queue, so fast connections take over
-    // the work of slow ones instead of everyone waiting on the slowest.
+    await fileHandle.truncate(total);
+    // Many small pieces from a shared queue, so fast connections pick up the
+    // slack of slow ones instead of everyone waiting for the slowest.
     const pieceSize = Math.max(4 * MB, Math.ceil(total / (connections * 4)));
     const pieces = [];
-    for (let s = 0; s < total; s += pieceSize) pieces.push([s, Math.min(s + pieceSize, total) - 1]);
+    for (let start = 0; start < total; start += pieceSize) pieces.push([start, Math.min(start + pieceSize, total) - 1]);
+
+    // The first permanent failure stops every other connection, and all of
+    // them settle before the file is closed: nothing keeps downloading or
+    // writes to a closed handle after this function has rejected.
+    const stopOthers = new AbortController();
+    const pieceSignal = signal ? AbortSignal.any([signal, stopOthers.signal]) : stopOthers.signal;
+    let firstError = null;
     const worker = async () => {
-      while (pieces.length) {
-        const [s, e] = pieces.shift();
-        await downloadRange(url, fh, s, e, signal, tracker);
+      while (pieces.length && !pieceSignal.aborted) {
+        const [start, end] = pieces.shift();
+        try {
+          await downloadRange(url, fileHandle, start, end, pieceSignal, tracker);
+        } catch (err) {
+          firstError ??= err;
+          stopOthers.abort();
+          return;
+        }
       }
     };
     await Promise.all(Array.from({ length: Math.min(connections, pieces.length) }, worker));
+    if (firstError) throw firstError;
+    signal?.throwIfAborted();
   } finally {
-    await fh.close();
+    await fileHandle.close();
   }
 }
 
 async function downloadSingle(url, file, signal, tracker) {
-  const res = await fetchWithTimeout(url, { signal, timeout: 60 * 60 * 1000 });
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-  const fh = await fsp.open(file, 'w');
+  const response = await fetchWithTimeout(url, { signal, timeout: 60 * 60 * 1000 });
+  if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
+  const fileHandle = await fsp.open(file, 'w');
   try {
-    for await (const chunk of res.body) {
-      await fh.write(chunk);
+    for await (const chunk of response.body) {
+      await fileHandle.write(chunk);
       tracker.add(chunk.length);
     }
   } finally {
-    await fh.close();
+    await fileHandle.close();
   }
 }
 
 /**
- * Download `url` to `dest` using several parallel range requests when the
- * server supports them. Verifies size and (optionally) SHA-256. Re-uses an
- * already downloaded file when it matches.
+ * Download `url` to `dest` (via `<dest>.part`), verifying size and optional
+ * SHA-256. Resolves with {dest, reused, size}.
  */
 export async function downloadFile({ url, dest, connections = 6, signal, onProgress, sha256 }) {
   await fsp.mkdir(path.dirname(dest), { recursive: true });
-  const info = await probe(url, signal);
-  const total = info.size;
+  const remote = await probeUrl(url, signal);
+  const total = remote.size;
 
   if (total && fs.existsSync(dest) && fs.statSync(dest).size === total) {
     if (!sha256 || (await hashFile(dest)) === sha256) {
@@ -131,26 +146,25 @@ export async function downloadFile({ url, dest, connections = 6, signal, onProgr
     }
   }
 
-  const part = `${dest}.part`;
+  const partFile = `${dest}.part`;
   const tracker = progressTracker(total, onProgress);
   try {
-    if (total && info.acceptRanges && connections > 1 && total > 16 * MB) {
-      await downloadSegmented(info.finalUrl, part, total, connections, signal, tracker);
-    } else {
-      await downloadSingle(info.finalUrl, part, signal, tracker);
-    }
-    tracker.done();
-    const size = fs.statSync(part).size;
+    const segmented = total && remote.acceptRanges && connections > 1 && total > SEGMENTED_MIN_BYTES;
+    if (segmented) await downloadSegmented(remote.finalUrl, partFile, total, connections, signal, tracker);
+    else await downloadSingle(remote.finalUrl, partFile, signal, tracker);
+    tracker.finish();
+
+    const size = fs.statSync(partFile).size;
     if (total && size !== total) throw new Error(`Downloaded size ${size} does not match expected ${total}`);
     if (sha256) {
-      const actual = await hashFile(part);
+      const actual = await hashFile(partFile);
       if (actual !== sha256) throw new Error(`SHA-256 mismatch (expected ${sha256}, got ${actual})`);
     }
     await fsp.rm(dest, { force: true });
-    await fsp.rename(part, dest);
+    await fsp.rename(partFile, dest);
     return { dest, reused: false, size };
   } catch (err) {
-    await fsp.rm(part, { force: true }).catch(() => {});
+    await fsp.rm(partFile, { force: true }).catch(() => {});
     throw err;
   }
 }

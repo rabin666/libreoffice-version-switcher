@@ -13,12 +13,12 @@ vi.mock('../utils/remote.js', () => ({
 }));
 vi.mock('../utils/download.js', async (importOriginal) => ({
   ...(await importOriginal()),
-  probe: async () => {
+  probeUrl: async () => {
     throw new Error('network down');
   },
 }));
 
-const { installVersion, targetDirName } = await import('../utils/install.js');
+const { installVersion, installFolderName } = await import('../utils/install.js');
 const { detectPlatform } = await import('../utils/platform.js');
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lovs-reinstall-'));
@@ -27,7 +27,7 @@ afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 describe.runIf(detectPlatform().supported)('installVersion --force', () => {
   const config = { installDir: path.join(tmp, 'versions'), downloadDir: path.join(tmp, 'dl'), connections: 1, downloader: 'builtin' };
-  const target = path.join(config.installDir, targetDirName('7.6.7.2', 'portable'));
+  const target = path.join(config.installDir, installFolderName('7.6.7.2', 'portable'));
   const profile = path.join(target, 'Data', 'settings', 'profile.xcu');
   const install = () => installVersion({ version: '7.6.7.2', method: 'portable', config, force: true });
 

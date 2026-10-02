@@ -1,25 +1,31 @@
-// Local web server for the UI: JSON API under /api, the built React app
-// (web_interface -> dist/ui) for everything else.
+// Local web server: the JSON API under /api, server-sent job events, and
+// the built React app (web_interface -> dist/ui) for everything else.
 //
 // The API can change PATH and run installers, so it is locked down:
 //  - binds to 127.0.0.1 by default
-//  - rejects requests whose Host header isn't localhost (DNS rebinding)
-//  - every API call needs a per-run token. The page gets it from
-//    /api/session; other websites can't read that response (no CORS).
+//  - rejects foreign Host headers (DNS rebinding)
+//  - every API call needs a per-run token; the page reads it from
+//    /api/session, which other origins can't (no CORS headers)
 
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pc from 'picocolors';
 import { APP_VERSION } from '../utils/appinfo.js';
 import { isWindows } from '../utils/platform.js';
 import { JobManager } from './jobs.js';
-import { HttpError, createRoutes, matchRoute } from './routes.js';
+import { HttpError, matchRoute } from './router.js';
+import { createRoutes } from './routes.js';
 
-const MIME = {
+const MAX_BODY_BYTES = 1024 * 1024;
+const PORT_ATTEMPTS = 10;
+const SSE_PING_MS = 20_000;
+
+const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -30,25 +36,23 @@ const MIME = {
   '.woff2': 'font/woff2',
 };
 
+/** dist/ui next to the bundle (dist/lovs.cjs), or ../dist/ui when running from source. */
 function findUiDir() {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  // bundled: dist/lovs.cjs -> dist/ui ; from source: api/ -> ../dist/ui
-  const candidates = [path.join(here, 'ui'), path.join(here, '..', 'dist', 'ui')];
-  return candidates.find((d) => fs.existsSync(path.join(d, 'index.html'))) ?? null;
+  return [path.join(here, 'ui'), path.join(here, '..', 'dist', 'ui')].find((dir) => fs.existsSync(path.join(dir, 'index.html'))) ?? null;
 }
 
 function sendJson(res, status, data) {
-  const body = JSON.stringify(data);
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-  res.end(body);
+  res.end(JSON.stringify(data));
 }
 
-async function readBody(req) {
+async function readJsonBody(req) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 1024 * 1024) throw new HttpError(413, 'Request body too large');
+    if (size > MAX_BODY_BYTES) throw new HttpError(413, 'Request body too large');
     chunks.push(chunk);
   }
   if (!chunks.length) return null;
@@ -59,38 +63,44 @@ async function readBody(req) {
   }
 }
 
-function serveStatic(uiDir, pathname, res) {
-  let rel;
+function decodeRequestPath(pathname) {
+  let relative;
   try {
-    rel = decodeURIComponent(pathname).replace(/^\/+/, '');
+    relative = decodeURIComponent(pathname).replace(/^\/+/, '');
   } catch {
     throw new HttpError(400, 'Malformed URL');
   }
-  if (rel.includes('\0')) throw new HttpError(400, 'Malformed URL');
+  if (relative.includes('\0')) throw new HttpError(400, 'Malformed URL');
+  return relative;
+}
+
+/** Serve a file from the UI build; unknown paths get index.html (client-side routing). */
+function serveStatic(uiDir, pathname, res) {
+  let relative = decodeRequestPath(pathname);
   if (!uiDir) {
     res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Web UI is not built. Run "npm run build:ui" (or use "npm run dev").');
     return;
   }
-  let file = path.join(uiDir, rel);
+  let file = path.join(uiDir, relative);
   const inside = path.relative(uiDir, file);
-  const escapes = inside.startsWith('..') || path.isAbsolute(inside);
-  if (escapes || !rel || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
-    rel = 'index.html'; // SPA fallback
-    file = path.join(uiDir, rel);
+  const escapesUiDir = inside.startsWith('..') || path.isAbsolute(inside);
+  if (escapesUiDir || !relative || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+    relative = 'index.html';
+    file = path.join(uiDir, relative);
   }
-  const ext = path.extname(file).toLowerCase();
   res.writeHead(200, {
-    'Content-Type': MIME[ext] ?? 'application/octet-stream',
-    'Cache-Control': rel.startsWith('assets/') ? 'public, max-age=31536000, immutable' : 'no-cache',
+    'Content-Type': CONTENT_TYPES[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
+    // Vite fingerprints everything under assets/, so those can be cached forever.
+    'Cache-Control': relative.startsWith('assets/') ? 'public, max-age=31536000, immutable' : 'no-cache',
     'X-Content-Type-Options': 'nosniff',
   });
   res.end(fs.readFileSync(file));
 }
 
 function openBrowser(url) {
-  const [cmd, args] = isWindows ? ['rundll32.exe', ['url.dll,FileProtocolHandler', url]] : ['xdg-open', [url]];
-  const child = spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true });
+  const [command, args] = isWindows ? ['rundll32.exe', ['url.dll,FileProtocolHandler', url]] : ['xdg-open', [url]];
+  const child = spawn(command, args, { detached: true, stdio: 'ignore', windowsHide: true });
   child.on('error', () => {});
   child.unref();
 }
@@ -111,64 +121,83 @@ function listen(server, port, host) {
   });
 }
 
+/** Listen on `port`, or the next free port up to PORT_ATTEMPTS later; returns the actual port. */
+async function listenOnFreePort(server, port, host) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await listen(server, port + attempt, host);
+      return server.address().port; // resolves port 0 too
+    } catch (err) {
+      if (err.code !== 'EADDRINUSE' || attempt >= PORT_ATTEMPTS) throw err;
+    }
+  }
+}
+
+const WILDCARD_HOSTS = new Set(['0.0.0.0', '::']);
+
+/** This machine's own names and addresses, as they appear in a Host header. */
+function ownHostNames() {
+  const names = [os.hostname().toLowerCase()];
+  for (const addresses of Object.values(os.networkInterfaces())) {
+    for (const { address, family } of addresses ?? []) names.push(family === 'IPv6' || family === 6 ? `[${address.toLowerCase()}]` : address);
+  }
+  return names;
+}
+
+/**
+ * Host headers we answer. Always loopback; plus the bind address, or — when
+ * bound to all interfaces — this machine's own addresses and hostname. Any
+ * other name (e.g. a DNS-rebinding domain pointing at us) is refused, so the
+ * session token never reaches a foreign origin.
+ */
+function allowedHosts(host, port) {
+  const names = ['127.0.0.1', 'localhost', '[::1]'];
+  if (WILDCARD_HOSTS.has(host)) names.push(...ownHostNames());
+  else if (!names.includes(host)) names.push(host.toLowerCase());
+  return new Set(names.map((name) => `${name}:${port}`));
+}
+
+/** Start the server; resolves with {server, port, url}. */
 export async function startServer({ port = 5178, host = '127.0.0.1', open = true } = {}) {
-  const token = crypto.randomBytes(24).toString('hex');
+  const sessionToken = crypto.randomBytes(24).toString('hex');
   const jobs = new JobManager();
   const routes = createRoutes({ jobs, appVersion: APP_VERSION });
   const uiDir = findUiDir();
-  const sseClients = new Set();
+  const eventClients = new Set();
   let actualPort = port;
 
   const broadcast = (event, data) => {
-    const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-    for (const res of sseClients) res.write(msg);
+    const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    for (const res of eventClients) res.write(message);
   };
   jobs.on('update', (job) => broadcast('job', job));
   jobs.on('removed', (id) => broadcast('job-removed', { id }));
 
-  const handle = async (req, res) => {
-    const hostHeader = String(req.headers.host ?? '').toLowerCase();
-    const okHosts = [`127.0.0.1:${actualPort}`, `localhost:${actualPort}`, `[::1]:${actualPort}`];
-    if (host !== '127.0.0.1' && host !== 'localhost') okHosts.push(`${host}:${actualPort}`);
-    if (!okHosts.includes(hostHeader)) {
-      res.writeHead(403).end('Forbidden host');
-      return;
-    }
+  const streamEvents = (res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
+    res.write(`event: jobs\ndata: ${JSON.stringify(jobs.list())}\n\n`);
+    eventClients.add(res);
+    const ping = setInterval(() => res.write(': ping\n\n'), SSE_PING_MS);
+    const forget = () => {
+      clearInterval(ping);
+      eventClients.delete(res);
+    };
+    res.on('close', forget);
+    res.on('error', forget);
+  };
 
-    let url;
-    try {
-      url = new URL(req.url, 'http://localhost');
-    } catch {
-      throw new HttpError(400, 'Malformed URL');
-    }
+  const handleApi = async (req, res, url) => {
     const { pathname } = url;
-    if (!pathname.startsWith('/api/')) {
-      if (req.method !== 'GET' && req.method !== 'HEAD') return void res.writeHead(405).end();
-      return serveStatic(uiDir, pathname, res);
-    }
-
     try {
-      if (pathname === '/api/session' && req.method === 'GET') return sendJson(res, 200, { token });
+      if (pathname === '/api/session' && req.method === 'GET') return sendJson(res, 200, { token: sessionToken });
+      const token = req.headers['x-lovs-token'] ?? url.searchParams.get('token'); // EventSource can't send headers
+      if (token !== sessionToken) throw new HttpError(401, 'Missing or invalid session token');
+      if (pathname === '/api/events' && req.method === 'GET') return streamEvents(res);
 
-      const given = req.headers['x-lovs-token'] ?? url.searchParams.get('token');
-      if (given !== token) throw new HttpError(401, 'Missing or invalid session token');
-
-      if (pathname === '/api/events' && req.method === 'GET') {
-        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
-        res.write(`event: jobs\ndata: ${JSON.stringify(jobs.list())}\n\n`);
-        sseClients.add(res);
-        const ping = setInterval(() => res.write(': ping\n\n'), 20000);
-        req.on('close', () => {
-          clearInterval(ping);
-          sseClients.delete(res);
-        });
-        return;
-      }
-
-      const match = matchRoute(routes, req.method, pathname);
-      if (!match) throw new HttpError(404, `No route for ${req.method} ${pathname}`);
-      const body = ['POST', 'PUT', 'DELETE'].includes(req.method) ? await readBody(req) : null;
-      const data = await match.handler({ params: match.params, query: Object.fromEntries(url.searchParams), body });
+      const route = matchRoute(routes, req.method, pathname);
+      if (!route) throw new HttpError(404, `No route for ${req.method} ${pathname}`);
+      const body = ['POST', 'PUT', 'DELETE'].includes(req.method) ? await readJsonBody(req) : null;
+      const data = await route.handler({ params: route.params, query: Object.fromEntries(url.searchParams), body });
       sendJson(res, 200, data ?? { ok: true });
     } catch (err) {
       const status = err.status ?? 500;
@@ -177,10 +206,25 @@ export async function startServer({ port = 5178, host = '127.0.0.1', open = true
     }
   };
 
-  // One error boundary for everything (static files included): a bad
-  // request must never take the server down.
+  const handleRequest = async (req, res) => {
+    if (!allowedHosts(host, actualPort).has(String(req.headers.host ?? '').toLowerCase())) {
+      res.writeHead(403).end('Forbidden host');
+      return;
+    }
+    let url;
+    try {
+      url = new URL(req.url, 'http://localhost');
+    } catch {
+      throw new HttpError(400, 'Malformed URL');
+    }
+    if (url.pathname.startsWith('/api/')) return handleApi(req, res, url);
+    if (req.method !== 'GET' && req.method !== 'HEAD') return void res.writeHead(405).end();
+    serveStatic(uiDir, url.pathname, res);
+  };
+
+  // One error boundary for every request: a bad request must never stop the server.
   const server = http.createServer((req, res) => {
-    handle(req, res).catch((err) => {
+    handleRequest(req, res).catch((err) => {
       const status = err.status ?? 500;
       if (status === 500) console.error(pc.red(`[http] ${req.method} ${req.url}: ${err.stack ?? err}`));
       if (res.headersSent) return void res.destroy();
@@ -189,17 +233,7 @@ export async function startServer({ port = 5178, host = '127.0.0.1', open = true
     });
   });
 
-  for (let attempt = 0; ; attempt++) {
-    try {
-      await listen(server, actualPort, host);
-      actualPort = server.address().port; // resolves port 0
-      break;
-    } catch (err) {
-      if (err.code !== 'EADDRINUSE' || attempt >= 10) throw err;
-      actualPort++;
-    }
-  }
-
+  actualPort = await listenOnFreePort(server, port, host);
   const shownHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
   const url = `http://${shownHost}:${actualPort}/`;
   console.log(`${pc.green('✔')} lovs web UI running at ${pc.bold(url)}`);

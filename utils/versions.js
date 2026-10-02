@@ -1,37 +1,38 @@
-// Version string helpers. LibreOffice archive versions look like
-// "25.2.7.2" (final) or "26.2.0.0.beta1" (pre-release).
+// Version strings. Archive versions look like "25.2.7.2" (final) or
+// "26.2.0.0.beta1" (pre-release); users may type prefixes like "7.6".
 
-const PRE_RE = /(alpha|beta|rc)\d*$/i;
+const PRERELEASE_TAG = /(alpha|beta|rc)\d*$/i;
 
-export function isVersionString(str) {
-  return /^\d+\.\d+(\.\d+){0,2}(\.(alpha|beta|rc)\d*)?$/i.test(str);
+export function isVersionString(text) {
+  return /^\d+\.\d+(\.\d+){0,2}(\.(alpha|beta|rc)\d*)?$/i.test(text);
 }
 
 export function isPrerelease(version) {
-  return PRE_RE.test(version);
+  return PRERELEASE_TAG.test(version);
 }
 
+/** "26.2.0.0.beta1" -> [26, 2, 0, 0] */
 export function numericParts(version) {
   return String(version)
     .split('.')
-    .filter((p) => /^\d+$/.test(p))
+    .filter((part) => /^\d+$/.test(part))
     .map(Number);
 }
 
+/** Sort comparator; a pre-release sorts before the final build with the same numbers. */
 export function compareVersions(a, b) {
-  const pa = numericParts(a);
-  const pb = numericParts(b);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
-    if (d !== 0) return d;
+  const partsA = numericParts(a);
+  const partsB = numericParts(b);
+  for (let i = 0; i < Math.max(partsA.length, partsB.length); i++) {
+    const difference = (partsA[i] ?? 0) - (partsB[i] ?? 0);
+    if (difference !== 0) return difference;
   }
-  // Same numbers: a pre-release sorts before the final build.
-  const ta = String(a).match(PRE_RE)?.[0] ?? '';
-  const tb = String(b).match(PRE_RE)?.[0] ?? '';
-  if (ta === tb) return 0;
-  if (!ta) return 1;
-  if (!tb) return -1;
-  return ta.localeCompare(tb, undefined, { numeric: true });
+  const tagA = String(a).match(PRERELEASE_TAG)?.[0] ?? '';
+  const tagB = String(b).match(PRERELEASE_TAG)?.[0] ?? '';
+  if (tagA === tagB) return 0;
+  if (!tagA) return 1;
+  if (!tagB) return -1;
+  return tagA.localeCompare(tagB, undefined, { numeric: true });
 }
 
 /** "25.2.7.2" -> "25.2" */
@@ -46,24 +47,21 @@ export function shortVersion(version) {
 
 /**
  * True when `version` matches a user spec such as "7.6", "7.6.5" or "7.6.5.2".
- * Pre-release specs ("26.8.0.0.beta1") must match exactly.
+ * Pre-release specs must match exactly.
  */
 export function matchesSpec(version, spec) {
   spec = String(spec).trim();
   if (isPrerelease(spec)) return version.toLowerCase() === spec.toLowerCase();
-  const sp = numericParts(spec);
-  if (sp.length === 0) return false;
-  const vp = numericParts(version);
-  return sp.every((n, i) => vp[i] === n);
+  const specParts = numericParts(spec);
+  if (specParts.length === 0) return false;
+  const versionParts = numericParts(version);
+  return specParts.every((number, i) => versionParts[i] === number);
 }
 
-/**
- * Pick the best version for a spec from a list: highest matching final build
- * ("latest" means the newest final build overall).
- */
-export function resolveSpec(versions, spec) {
-  const list = [...versions].sort(compareVersions).reverse();
-  if (!spec || spec === 'latest') return list.find((v) => !isPrerelease(v)) ?? null;
-  if (isPrerelease(spec)) return list.find((v) => matchesSpec(v, spec)) ?? null;
-  return list.find((v) => !isPrerelease(v) && matchesSpec(v, spec)) ?? null;
+/** Newest final build matching `spec` ("latest" or empty = newest overall), or null. */
+export function bestMatchingVersion(versions, spec) {
+  const newestFirst = [...versions].sort(compareVersions).reverse();
+  if (!spec || spec === 'latest') return newestFirst.find((v) => !isPrerelease(v)) ?? null;
+  if (isPrerelease(spec)) return newestFirst.find((v) => matchesSpec(v, spec)) ?? null;
+  return newestFirst.find((v) => !isPrerelease(v) && matchesSpec(v, spec)) ?? null;
 }

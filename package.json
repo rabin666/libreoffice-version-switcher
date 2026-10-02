@@ -11,7 +11,8 @@
     "api",
     "cli",
     "utils",
-    "dist"
+    "dist",
+    "readme.help.md"
   ],
   "engines": {
     "node": ">=22.12"

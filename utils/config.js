@@ -1,3 +1,6 @@
+// User settings in <LOVS_HOME>/config.json. CONFIG_SCHEMA drives validation,
+// `lovs config` and the web Settings page.
+
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,10 +13,6 @@ export function lovsHome() {
 export const configFile = () => path.join(lovsHome(), 'config.json');
 export const cacheDir = () => path.join(lovsHome(), 'cache');
 
-/**
- * Every config key with its type, default and a short description.
- * The CLI (`lovs config`) and the web Settings page are both driven by this.
- */
 export const CONFIG_SCHEMA = {
   installDir: {
     type: 'path',
@@ -89,31 +88,34 @@ export const CONFIG_SCHEMA = {
   },
 };
 
+/** Keys whose blank value means "use the default" rather than "auto-detect". */
+const REQUIRED_PATH_KEYS = ['installDir', 'downloadDir'];
+
 export function defaultConfig() {
-  return Object.fromEntries(Object.entries(CONFIG_SCHEMA).map(([k, s]) => [k, s.default()]));
+  return Object.fromEntries(Object.entries(CONFIG_SCHEMA).map(([key, schema]) => [key, schema.default()]));
 }
 
+/** Stored settings over the defaults; invalid stored values are ignored. */
 export function loadConfig() {
   let stored = {};
   try {
     stored = JSON.parse(fs.readFileSync(configFile(), 'utf8'));
   } catch {
-    // missing or unreadable config -> defaults
+    // missing or unreadable file: defaults only
   }
-  const cfg = defaultConfig();
+  const config = defaultConfig();
   for (const key of Object.keys(CONFIG_SCHEMA)) {
-    if (stored[key] !== undefined && stored[key] !== null) {
-      try {
-        cfg[key] = coerceValue(key, stored[key]);
-      } catch {
-        // ignore invalid stored values
-      }
+    if (stored[key] === undefined || stored[key] === null) continue;
+    try {
+      config[key] = coerceValue(key, stored[key]);
+    } catch {
+      // keep the default
     }
   }
-  return cfg;
+  return config;
 }
 
-/** Validate and convert a raw value (string from the CLI, or JSON from the UI). */
+/** Validate and convert a raw value (a string from the CLI, or JSON from the UI). */
 export function coerceValue(key, value) {
   const schema = CONFIG_SCHEMA[key];
   if (!schema) throw new Error(`Unknown config key "${key}". Known keys: ${Object.keys(CONFIG_SCHEMA).join(', ')}`);
@@ -122,7 +124,8 @@ export function coerceValue(key, value) {
       return value === '' || value == null ? '' : path.resolve(String(value));
     case 'paths': {
       const list = Array.isArray(value) ? value : String(value).split(path.delimiter);
-      return [...new Set(list.map((v) => String(v).trim()).filter(Boolean).map((v) => path.resolve(v)))];
+      const cleaned = list.map((entry) => String(entry).trim()).filter(Boolean).map((entry) => path.resolve(entry));
+      return [...new Set(cleaned)];
     }
     case 'boolean':
       if (typeof value === 'boolean') return value;
@@ -130,11 +133,11 @@ export function coerceValue(key, value) {
       if (/^(false|0|no|off)$/i.test(String(value))) return false;
       throw new Error(`${key} must be true or false`);
     case 'number': {
-      const n = Number(value);
-      if (!Number.isInteger(n) || n < schema.min || n > schema.max) {
+      const number = Number(value);
+      if (!Number.isInteger(number) || number < schema.min || number > schema.max) {
         throw new Error(`${key} must be an integer between ${schema.min} and ${schema.max}`);
       }
-      return n;
+      return number;
     }
     case 'enum':
       if (!schema.values.includes(value)) throw new Error(`${key} must be one of: ${schema.values.join(', ')}`);
@@ -144,17 +147,16 @@ export function coerceValue(key, value) {
   }
 }
 
-/** Merge `changes` into the stored config and return the full result. */
+/** Validate `changes`, merge them into the stored settings and return the result. */
 export function saveConfig(changes) {
-  const cfg = loadConfig();
+  const config = loadConfig();
   for (const [key, value] of Object.entries(changes)) {
-    cfg[key] = coerceValue(key, value);
+    config[key] = coerceValue(key, value);
   }
-  // Fill blanks back with defaults so paths are never empty.
-  for (const key of ['installDir', 'downloadDir']) {
-    if (!cfg[key]) cfg[key] = CONFIG_SCHEMA[key].default();
+  for (const key of REQUIRED_PATH_KEYS) {
+    if (!config[key]) config[key] = CONFIG_SCHEMA[key].default();
   }
   fs.mkdirSync(lovsHome(), { recursive: true });
-  fs.writeFileSync(configFile(), JSON.stringify(cfg, null, 2) + '\n');
-  return cfg;
+  fs.writeFileSync(configFile(), `${JSON.stringify(config, null, 2)}\n`);
+  return config;
 }

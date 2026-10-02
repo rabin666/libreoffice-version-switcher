@@ -4,10 +4,12 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { acquireInstallLock, commitInstall, setUserInstallation, uninstallInstall } from '../utils/install.js';
-import { hasIsolatedProfile, installFromPath, scanLocalInstalls } from '../utils/local.js';
+import { commitInstall, uninstall } from '../utils/install.js';
+import { acquireInstallLock } from '../utils/lock.js';
+import { hasIsolatedProfile, setUserInstallation } from '../utils/profile.js';
+import { installFromPath, scanLocalInstalls } from '../utils/local.js';
 import { sofficeName } from '../utils/platform.js';
-import { run } from '../utils/proc.js';
+import { runCommand } from '../utils/proc.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lovs-safety-'));
 process.env.LOVS_HOME = path.join(tmp, 'home');
@@ -42,17 +44,17 @@ describe('ownership', () => {
   it('agrees with uninstall about nested folders', async () => {
     const inst = installFromPath(nested, config);
     expect(inst.managed).toBe(false);
-    await expect(uninstallInstall(inst, config)).rejects.toThrow(/real location/);
+    await expect(uninstall(inst, config)).rejects.toThrow(/real location/);
     expect(fs.existsSync(nested)).toBe(true);
   });
 
   it('refuses to uninstall an install lovs did not create', async () => {
-    await expect(uninstallInstall(installFromPath(unmarked, config), config)).rejects.toThrow(/not installed by lovs/);
+    await expect(uninstall(installFromPath(unmarked, config), config)).rejects.toThrow(/not installed by lovs/);
     expect(fs.existsSync(unmarked)).toBe(true);
   });
 
   it('uninstalls its own installs', async () => {
-    const res = await uninstallInstall(installFromPath(marked, config), config);
+    const res = await uninstall(installFromPath(marked, config), config);
     expect(fs.existsSync(marked)).toBe(false);
     expect(res.removed).toBeTruthy();
   });
@@ -75,13 +77,13 @@ describe('links out of the install folder', () => {
 
   it('refuses to delete through a link inside a subfolder', async () => {
     const inst = { ...installFromPath(path.join(installDir, 'linked', 'LibreOffice_7.5'), config), managed: true };
-    await expect(uninstallInstall(inst, config)).rejects.toThrow(/real location/);
+    await expect(uninstall(inst, config)).rejects.toThrow(/real location/);
     expect(fs.existsSync(path.join(victim, 'program', sofficeName))).toBe(true);
   });
 
   it('refuses to delete a top-level link to another folder', async () => {
     const inst = { ...installFromPath(path.join(installDir, 'LibreOffice_7.5'), config), managed: true };
-    await expect(uninstallInstall(inst, config)).rejects.toThrow(/real location/);
+    await expect(uninstall(inst, config)).rejects.toThrow(/real location/);
     expect(fs.existsSync(path.join(victim, 'program', sofficeName))).toBe(true);
   });
 });
@@ -179,12 +181,12 @@ describe('install lock', () => {
     const root = fakeInstall(path.join(installDir, 'LibreOffice_7.3'));
     const release = await acquireInstallLock(installDir, 'LibreOffice_7.3');
     try {
-      await expect(uninstallInstall(installFromPath(root, config), config)).rejects.toThrow(/is busy/);
+      await expect(uninstall(installFromPath(root, config), config)).rejects.toThrow(/is busy/);
       expect(fs.existsSync(root)).toBe(true);
     } finally {
       release();
     }
-    await uninstallInstall(installFromPath(root, config), config);
+    await uninstall(installFromPath(root, config), config);
     expect(fs.existsSync(root)).toBe(false);
   });
 });
@@ -210,7 +212,7 @@ describe('cancellation', () => {
     const ac = new AbortController();
     ac.abort();
     const script = `require('fs').writeFileSync(${JSON.stringify(marker)}, 'x')`;
-    await expect(run(process.execPath, ['-e', script], { signal: ac.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(runCommand(process.execPath, ['-e', script], { signal: ac.signal })).rejects.toMatchObject({ name: 'AbortError' });
     await new Promise((r) => setTimeout(r, 300));
     expect(fs.existsSync(marker)).toBe(false);
   });

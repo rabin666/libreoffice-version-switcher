@@ -1,14 +1,18 @@
-// Thin client for the lovs API (api/server.js). Every call carries the
-// per-run session token; if the server restarted, the token is refreshed once.
+// Thin client for the lovs HTTP API (api/server.js): JSON requests and the live job event stream.
+// Every call carries the per-run session token; if the server restarted, the token is refreshed once.
+
+const TOKEN_HEADER = 'X-Lovs-Token';
+const RECONNECT_DELAY_MS = 2000;
 
 let tokenPromise = null;
 
-function getToken(force = false) {
-  if (force || !tokenPromise) {
+function getToken({ refresh = false } = {}) {
+  if (refresh || !tokenPromise) {
     tokenPromise = fetch('/api/session')
-      .then((r) => r.json())
-      .then((d) => d.token)
+      .then((response) => response.json())
+      .then((session) => session.token)
       .catch((err) => {
+        // Don't cache a failure: the next call should try again.
         tokenPromise = null;
         throw err;
       });
@@ -16,85 +20,66 @@ function getToken(force = false) {
   return tokenPromise;
 }
 
-export async function api(path, { method = 'GET', body } = {}, retried = false) {
+async function sendRequest(path, { method, body }) {
+  const hasBody = body !== undefined;
   const token = await getToken();
-  const res = await fetch(path, {
+  return fetch(path, {
     method,
-    headers: { 'X-Lovs-Token': token, ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    headers: { [TOKEN_HEADER]: token, ...(hasBody ? { 'Content-Type': 'application/json' } : {}) },
+    body: hasBody ? JSON.stringify(body) : undefined,
   });
-  if (res.status === 401 && !retried) {
-    await getToken(true);
-    return api(path, { method, body }, true);
+}
+
+/** Calls a JSON endpoint and returns the parsed body; throws with the server's error message on failure. */
+export async function api(path, { method = 'GET', body } = {}) {
+  let response = await sendRequest(path, { method, body });
+  if (response.status === 401) {
+    // A restarted server issues a new token, so fetch it and retry once.
+    await getToken({ refresh: true });
+    response = await sendRequest(path, { method, body });
   }
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed (HTTP ${res.status})`);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `Request failed (HTTP ${response.status})`);
   return data;
 }
 
-/** Live job updates over Server-Sent Events. Returns an unsubscribe function. */
+/**
+ * Live job updates over Server-Sent Events, reconnecting after errors.
+ * Returns an unsubscribe function.
+ */
 export function subscribeJobs({ onSnapshot, onUpdate, onRemoved, onConnection }) {
-  let es = null;
-  let closed = false;
-  let retry = null;
+  let eventSource = null;
+  let unsubscribed = false;
+  let reconnectTimer = null;
 
-  const connect = async () => {
+  const scheduleReconnect = () => {
+    onConnection?.(false);
+    if (!unsubscribed) reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
+  };
+
+  async function connect() {
     try {
-      const token = await getToken(es !== null);
-      if (closed) return;
-      es = new EventSource(`/api/events?token=${encodeURIComponent(token)}`);
-      es.addEventListener('open', () => onConnection?.(true));
-      es.addEventListener('jobs', (e) => onSnapshot(JSON.parse(e.data)));
-      es.addEventListener('job', (e) => onUpdate(JSON.parse(e.data)));
-      es.addEventListener('job-removed', (e) => onRemoved(JSON.parse(e.data).id));
-      es.addEventListener('error', () => {
-        onConnection?.(false);
-        es.close();
-        if (!closed) retry = setTimeout(connect, 2000);
+      // On a reconnect the server may have restarted, so don't trust the cached token.
+      const token = await getToken({ refresh: eventSource !== null });
+      if (unsubscribed) return;
+      eventSource = new EventSource(`/api/events?token=${encodeURIComponent(token)}`);
+      eventSource.addEventListener('open', () => onConnection?.(true));
+      eventSource.addEventListener('jobs', (event) => onSnapshot(JSON.parse(event.data)));
+      eventSource.addEventListener('job', (event) => onUpdate(JSON.parse(event.data)));
+      eventSource.addEventListener('job-removed', (event) => onRemoved(JSON.parse(event.data).id));
+      eventSource.addEventListener('error', () => {
+        eventSource.close();
+        scheduleReconnect();
       });
     } catch {
-      onConnection?.(false);
-      if (!closed) retry = setTimeout(connect, 2000);
+      scheduleReconnect();
     }
-  };
+  }
+
   connect();
   return () => {
-    closed = true;
-    clearTimeout(retry);
-    es?.close();
+    unsubscribed = true;
+    clearTimeout(reconnectTimer);
+    eventSource?.close();
   };
-}
-
-export function formatBytes(n) {
-  if (n == null || !Number.isFinite(n)) return '–';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let i = 0;
-  while (n >= 1024 && i < units.length - 1) {
-    n /= 1024;
-    i++;
-  }
-  return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
-}
-
-export function formatDuration(sec) {
-  if (!Number.isFinite(sec) || sec < 0) return '–';
-  if (sec < 60) return `${Math.round(sec)}s`;
-  const m = Math.floor(sec / 60);
-  return m < 60 ? `${m}m ${String(Math.round(sec % 60)).padStart(2, '0')}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
-}
-
-export async function copyText(text) {
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch {
-    // http://127.0.0.1 is a secure context, but fall back just in case
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    const ok = document.execCommand('copy');
-    ta.remove();
-    return ok;
-  }
 }

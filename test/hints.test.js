@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { toMsysPath, subshellPlan } from '../utils/envcmd.js';
+import { toMsysPath, subshellLaunchPlan } from '../utils/shell.js';
 import { resolveInstall, scanLocalInstalls, selectorFor } from '../utils/local.js';
 import { isWindows, sofficeName } from '../utils/platform.js';
 
@@ -60,7 +60,7 @@ describe('selectorFor', () => {
 
 const bash = (() => {
   try {
-    const plan = subshellPlan('bash', tmp, { tmpDir: tmp });
+    const plan = subshellLaunchPlan('bash', tmp, { tmpDir: tmp });
     return spawnSync(plan.command, ['-c', 'true']).status === 0 ? plan.command : null;
   } catch {
     return null;
@@ -69,14 +69,14 @@ const bash = (() => {
 
 describe.runIf(bash)('generated bash hint for an external folder', () => {
   it('activates that folder when pasted into bash', async () => {
-    const { hintsFor } = await import('../cli/commands.js');
+    const { hintsFor } = await import('../cli/hints.js');
     const inst = await resolveInstall(config, external);
     const hints = await hintsFor(inst, config, 'bash');
-    expect(hints.env).not.toContain(inst.id);
+    expect(hints.activate).not.toContain(inst.id);
 
     const index = path.resolve('index.js');
     const node = isWindows ? toMsysPath(process.execPath) : process.execPath;
-    const script = `lovs() { "${node}" "${isWindows ? toMsysPath(index) : index}" "$@"; }\n${hints.env}\nprintf %s "\${PATH%%:*}"`;
+    const script = `lovs() { "${node}" "${isWindows ? toMsysPath(index) : index}" "$@"; }\n${hints.activate}\nprintf %s "\${PATH%%:*}"`;
     const res = spawnSync(bash, ['-c', script], { env: { ...process.env, TEAM: 'expanded' }, encoding: 'utf8' });
     const expected = isWindows ? toMsysPath(inst.programDir) : inst.programDir;
     expect(res.stderr).toBe('');

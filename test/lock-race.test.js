@@ -10,11 +10,11 @@ import { afterAll, describe, expect, it } from 'vitest';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lovs-lockrace-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-const installJs = pathToFileURL(path.resolve('utils/install.js')).href;
+const lockModule = pathToFileURL(path.resolve('utils/lock.js')).href;
 const worker = path.join(tmp, 'worker.mjs');
 fs.writeFileSync(
   worker,
-  `import { acquireInstallLock } from ${JSON.stringify(installJs)};
+  `import { acquireInstallLock } from ${JSON.stringify(lockModule)};
 const [dir, name, startAt] = process.argv.slice(2);
 while (Date.now() < Number(startAt)) {} // start everyone at the same moment
 try {

@@ -1,57 +1,64 @@
+// Describes the current machine in the terms the LibreOffice archive uses.
+
 import fs from 'node:fs';
 import os from 'node:os';
 
 export const isWindows = process.platform === 'win32';
 
-/** Directory name used by the archive for each CPU architecture. */
-const ARCH_DIRS = { x64: 'x86_64', arm64: 'aarch64', ia32: 'x86' };
+export const sofficeName = isWindows ? 'soffice.exe' : 'soffice';
+
+/** Archive folder name for each Node CPU architecture. */
+const ARCHIVE_ARCH_DIRS = { x64: 'x86_64', arm64: 'aarch64', ia32: 'x86' };
+
+const OS_NAMES = { win32: 'windows', linux: 'linux', darwin: 'mac' };
 
 function readOsRelease() {
   try {
-    const text = fs.readFileSync('/etc/os-release', 'utf8');
-    const out = {};
-    for (const line of text.split('\n')) {
-      const m = line.match(/^([A-Z_]+)=(.*)$/);
-      if (m) out[m[1]] = m[2].replace(/^"|"$/g, '');
+    const fields = {};
+    for (const line of fs.readFileSync('/etc/os-release', 'utf8').split('\n')) {
+      const match = line.match(/^([A-Z_]+)=(.*)$/);
+      if (match) fields[match[1]] = match[2].replace(/^"|"$/g, '');
     }
-    return out;
+    return fields;
   } catch {
     return {};
   }
 }
 
-let cached;
+function linuxPackageFamily(osRelease) {
+  const ids = `${osRelease.ID ?? ''} ${osRelease.ID_LIKE ?? ''}`.toLowerCase();
+  if (/debian|ubuntu|mint|pop/.test(ids)) return 'deb';
+  if (/rhel|fedora|centos|ol|rocky|almalinux|suse|amzn/.test(ids)) return 'rpm';
+  return null;
+}
+
+let cachedPlatform;
 
 /**
- * Describe the current machine in the terms the LibreOffice archive uses.
- * packageFamily is 'deb' on Debian/Ubuntu and 'rpm' on RHEL/Oracle/Fedora/SUSE.
+ * {os, arch, archDir, packageFamily, distro, pretty, supported}.
+ * packageFamily is 'deb' (Debian/Ubuntu) or 'rpm' (RHEL/Oracle/Fedora/SUSE) on Linux.
  */
 export function detectPlatform() {
-  if (cached) return cached;
-  const p = process.platform;
-  const info = {
-    os: p === 'win32' ? 'windows' : p === 'linux' ? 'linux' : p === 'darwin' ? 'mac' : p,
+  if (cachedPlatform) return cachedPlatform;
+  const platform = {
+    os: OS_NAMES[process.platform] ?? process.platform,
     arch: process.arch,
-    archDir: ARCH_DIRS[process.arch] ?? null,
+    archDir: ARCHIVE_ARCH_DIRS[process.arch] ?? null,
     packageFamily: null,
     distro: null,
-    pretty: null,
+    pretty: `${process.platform} ${os.release()}`,
   };
-  if (info.os === 'windows') {
-    info.pretty = `Windows ${os.release()}`;
-  } else if (info.os === 'linux') {
-    const rel = readOsRelease();
-    const ids = `${rel.ID ?? ''} ${rel.ID_LIKE ?? ''}`.toLowerCase();
-    info.distro = rel.ID ?? null;
-    info.pretty = rel.PRETTY_NAME ?? 'Linux';
-    if (/debian|ubuntu|mint|pop/.test(ids)) info.packageFamily = 'deb';
-    else if (/rhel|fedora|centos|ol|rocky|almalinux|suse|amzn/.test(ids)) info.packageFamily = 'rpm';
-  } else {
-    info.pretty = `${p} ${os.release()}`;
+  if (platform.os === 'windows') {
+    platform.pretty = `Windows ${os.release()}`;
+  } else if (platform.os === 'linux') {
+    const osRelease = readOsRelease();
+    platform.distro = osRelease.ID ?? null;
+    platform.pretty = osRelease.PRETTY_NAME ?? 'Linux';
+    platform.packageFamily = linuxPackageFamily(osRelease);
   }
-  info.supported = (info.os === 'windows' || info.os === 'linux') && info.archDir !== null;
-  cached = info;
-  return info;
+  platform.supported = (platform.os === 'windows' || platform.os === 'linux') && platform.archDir !== null;
+  cachedPlatform = platform;
+  return platform;
 }
 
 /** Install methods available on this platform, preferred first. */
@@ -60,5 +67,3 @@ export function installMethods(platform = detectPlatform()) {
   if (platform.os === 'linux') return platform.packageFamily === 'rpm' ? ['rpm', 'deb'] : ['deb', 'rpm'];
   return [];
 }
-
-export const sofficeName = isWindows ? 'soffice.exe' : 'soffice';
