@@ -2,14 +2,17 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
-import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { downloadFile } from '../utils/download.js';
 
 const SIZE = 20 * 1024 * 1024; // above the 16 MB segmented threshold
 const content = crypto.randomBytes(SIZE);
-const tmp = fs.mkdtempSync(path.join(process.cwd(), 'tmpFiles', 'lovs-download-'));
+// Inside the repo (tmpFiles/ is gitignored) rather than the system temp
+// folder: the test writes tens of MB. Created here, since clones lack it.
+const tmpRoot = path.join(process.cwd(), 'tmpFiles');
+fs.mkdirSync(tmpRoot, { recursive: true });
+const tmp = fs.mkdtempSync(path.join(tmpRoot, 'lovs-download-'));
 let server;
 let baseUrl;
 let failFirstPiece = false;

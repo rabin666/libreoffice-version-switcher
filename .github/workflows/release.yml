@@ -1,0 +1,166 @@
+# Release: test on Linux and Windows, build the standalone executables and the
+# Node bundle, smoke-test each executable on its own OS, then publish a
+# GitHub release with checksums.
+#
+# Trigger: push a tag matching package.json's version, e.g.
+#   npm version 0.2.0 && git push --follow-tags
+# Tags with a suffix (v0.2.0-rc.1) become pre-releases.
+# "Run workflow" (manual) does everything except publishing: a dry run whose
+# files are kept as workflow artifacts.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  build:
+    name: Build
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Check the tag matches package.json
+        id: version
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $version (expected v$version)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          [[ "$version" == *-* ]] && prerelease=true || prerelease=false
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+      - run: npm ci
+
+      # pkg downloads a Node base binary per target; keep them between runs.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.pkg-cache
+          key: pkg-cache-${{ hashFiles('package-lock.json') }}
+
+      # `npm run pkg` builds the UI + bundle, then all targets from package.json
+      # (--no-bytecode makes cross-compiling from Linux possible).
+      - name: Build executables
+        run: npm run pkg
+
+      - name: Package release files
+        shell: bash
+        run: |
+          version='${{ steps.version.outputs.version }}'
+          mkdir -p out
+          cp release/lovs-win-x64.exe   "out/lovs-${version}-win-x64.exe"
+          cp release/lovs-linux-x64     "out/lovs-${version}-linux-x64"
+          cp release/lovs-linux-arm64   "out/lovs-${version}-linux-arm64"
+          chmod +x out/*-linux-*
+          # For machines that already have Node >= 22.12: `node lovs.cjs …`
+          tar -czf "out/lovs-${version}-node.tar.gz" -C dist lovs.cjs ui
+          (cd out && sha256sum * > SHA256SUMS.txt)
+          cat out/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke:
+    name: Smoke test (${{ matrix.target }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            exe: lovs-linux-x64
+          - os: windows-latest
+            target: win-x64
+            exe: lovs-win-x64.exe
+    runs-on: ${{ matrix.os }}
+    env:
+      LOVS_HOME: ${{ github.workspace }}/lovs-home
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+      - name: Run the executable
+        shell: bash
+        run: |
+          exe="./lovs-${{ needs.build.outputs.version }}-${{ matrix.target }}"
+          [[ "${{ matrix.target }}" == win-* ]] && exe="$exe.exe"
+          chmod +x "$exe" || true
+          test "$("$exe" --version)" = '${{ needs.build.outputs.version }}'
+          "$exe" --help > /dev/null
+          "$exe" doctor
+          "$exe" list
+
+  release:
+    name: Publish GitHub release
+    needs: [build, smoke]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+          path: out
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: lovs ${{ needs.build.outputs.version }}
+          prerelease: ${{ needs.build.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: out/*
+          body: |
+            ## Downloads
+
+            | File | For |
+            | --- | --- |
+            | `lovs-${{ needs.build.outputs.version }}-win-x64.exe` | Windows x64 (standalone) |
+            | `lovs-${{ needs.build.outputs.version }}-linux-x64` | Linux x64, glibc 2.28+ (Ubuntu 20.04+, RHEL/Oracle 8+) |
+            | `lovs-${{ needs.build.outputs.version }}-linux-arm64` | Linux arm64, glibc 2.28+ |
+            | `lovs-${{ needs.build.outputs.version }}-node.tar.gz` | Any OS with Node ≥ 22.12: `node lovs.cjs …` |
+
+            Verify with `sha256sum -c SHA256SUMS.txt`. On Linux run `chmod +x` first; rename the file to `lovs` and put it on your PATH.

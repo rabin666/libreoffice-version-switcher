@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { isInside } from '../utils/fsutil.js';
 import { matchInstall, scanLocalInstalls, versionFromPath } from '../utils/local.js';
 import { sofficeName } from '../utils/platform.js';
 
@@ -24,15 +25,20 @@ describe('local scan', () => {
   fakeInstall(path.join(scanDir, 'LibreOfficePortablePrevious_7.6.5', 'App', 'libreoffice'), { versionIni: '7.6.5.2' });
   fakeInstall(path.join(scanDir, 'LibreOfficePortablePrevious_7.6.7.2', 'App', 'libreoffice'), { versionIni: '7.6.7.2' });
 
+  // The scan also covers system locations; keep only this test's fixtures so
+  // a machine with LibreOffice installed (e.g. /usr/lib/libreoffice) passes too.
+  const scanFixtures = async () =>
+    (await scanLocalInstalls({ installDir, scanDirs: [scanDir] }, { probe: false })).filter((install) => isInside(install.root, tmp));
+
   it('finds managed and portable installs with versions', async () => {
-    const list = await scanLocalInstalls({ installDir, scanDirs: [scanDir] }, { probe: false });
+    const list = await scanFixtures();
     expect(list.map((i) => i.version)).toEqual(['25.2.7.2', '7.6.7.2', '7.6.5.2']);
     expect(list[0]).toMatchObject({ source: 'managed', kind: 'msi' });
     expect(list[1]).toMatchObject({ source: 'scanned', kind: 'portable', label: 'LibreOfficePortablePrevious_7.6.7.2' });
   });
 
   it('resolves version prefixes to the newest match', async () => {
-    const list = await scanLocalInstalls({ installDir, scanDirs: [scanDir] }, { probe: false });
+    const list = await scanFixtures();
     expect(matchInstall(list, '7.6').version).toBe('7.6.7.2');
     expect(matchInstall(list, '7.6.5').version).toBe('7.6.5.2');
     expect(() => matchInstall(list, '6.4')).toThrow(/No local install/);

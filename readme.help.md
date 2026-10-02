@@ -452,6 +452,24 @@ flowchart LR
 - `PKG_CACHE_PATH` moves pkg's Node binary cache, which is useful when the system drive is full.
 - The Linux binaries need glibc 2.28+ (RHEL/Oracle Linux 8+, Ubuntu 20.04+).
 
+### Releases (GitHub Actions)
+
+[.github/workflows/release.yml](.github/workflows/release.yml) runs on a pushed `v*.*.*` tag:
+
+```mermaid
+flowchart LR
+  T(["push tag vX.Y.Z"]) --> TE["test<br/>ubuntu + windows"]
+  TE --> B["build (ubuntu)<br/>tag = package.json version?<br/>npm run pkg · node tarball · SHA256SUMS"]
+  B --> S["smoke<br/>linux-x64 on ubuntu<br/>win-x64 on windows"]
+  S --> R(["GitHub release<br/>files + generated notes"])
+```
+
+- **Cut a release:** `npm version 0.2.0 && git push --follow-tags`. A tag with a suffix (`v0.2.0-rc.1`) becomes a pre-release.
+- **The build fails** if the tag doesn't match `package.json`'s version.
+- **Dry run:** start the workflow manually (Actions → Release → Run workflow). Everything runs except publishing, and the files stay downloadable as the `release-files` artifact for 14 days.
+- **Release assets:** `lovs-<v>-win-x64.exe`, `lovs-<v>-linux-x64`, `lovs-<v>-linux-arm64`, `lovs-<v>-node.tar.gz` (`dist/lovs.cjs` + `dist/ui`, for any OS with Node) and `SHA256SUMS.txt`.
+- **Testing changes:** check the workflow with [actionlint](https://github.com/rhysd/actionlint) before pushing.
+
 ## 11. How to…
 
 **Add a CLI command**

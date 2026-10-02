@@ -141,6 +141,14 @@ npm run pkg:linux    # Linux x64 + arm64
 
 `scripts/build.mjs` bundles everything into one CommonJS file with esbuild. pkg then embeds it together with `dist/ui`. Builds use `--no-bytecode`, so all targets cross-compile from any OS. Set `PKG_CACHE_PATH` to move pkg's Node binary cache (default `~/.pkg-cache`). The Linux binaries need glibc 2.28+ (RHEL/Oracle Linux 8+, Ubuntu 20.04+).
 
+### Releasing
+
+```sh
+npm version 0.1.0 && git push --follow-tags   # tag v0.1.0 -> GitHub Actions builds and publishes the release
+```
+
+The [Release workflow](.github/workflows/release.yml) tests on Linux and Windows, builds all executables plus a Node bundle and `SHA256SUMS.txt`, smoke-tests them, and attaches them to the GitHub release. Running it manually is a dry run.
+
 ### Layout
 
 ```
