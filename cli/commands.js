@@ -1,13 +1,15 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline/promises';
 import { Command, Option } from 'commander';
 import pc from 'picocolors';
 import { APP_VERSION } from '../utils/appinfo.js';
 import { CONFIG_SCHEMA, configFile, loadConfig, lovsHome, saveConfig } from '../utils/config.js';
-import { SHELLS, detectShell, envCommand, envCommands, evalHint } from '../utils/envcmd.js';
+import { SHELLS, detectShell, envCommand, envCommands, evalHint, shellArg, subshellPlan } from '../utils/envcmd.js';
 import { defaultMethod, findSevenZip, installVersion, resolveDownloader, uninstallInstall } from '../utils/install.js';
-import { resolveInstall, scanLocalInstalls } from '../utils/local.js';
+import { resolveInstall, scanLocalInstalls, selectorFor } from '../utils/local.js';
 import { SCOPES, addToPath, getPathStatus, pathFlagsFor, removeFromPath, samePath } from '../utils/pathenv.js';
 import { detectPlatform, installMethods, isWindows } from '../utils/platform.js';
 import { findOnPath } from '../utils/proc.js';
@@ -45,6 +47,25 @@ async function resolveRemote(spec, { refresh } = {}) {
   if (!version) throw new Error(`No version in the archive matches "${spec}"`);
   return version;
 }
+
+/**
+ * Ready-to-paste `lovs` commands that select exactly `inst` again, quoted
+ * for `shell`. Uses the same scan (with version probing) as the commands
+ * themselves, so a version or id is only suggested when it resolves back to
+ * this install; otherwise the absolute folder is used. null when the folder
+ * can't be written for this shell (e.g. a % in it, for cmd.exe).
+ */
+export async function hintsFor(inst, config, shell = detectShell()) {
+  const spec = selectorFor(inst, await scanLocalInstalls(config));
+  try {
+    const arg = shellArg(shell, spec);
+    return { env: evalHint(shell, spec), exec: (args) => `lovs exec ${arg} -- ${args}`, pathAdd: `lovs path add ${arg}` };
+  } catch {
+    return null;
+  }
+}
+
+const NO_HINT = `(this folder can't be passed literally in ${detectShell()}; use another shell)`;
 
 function printWarnings(list) {
   for (const w of list ?? []) warn(w);
@@ -156,9 +177,12 @@ async function cmdInstall(spec, opts) {
     });
     bar.done();
     ok(`Installed ${pc.bold(version)} at ${inst.portableRoot ?? inst.root}`);
-    console.log(`\n  Use it in this shell:   ${pc.bold(evalHint(detectShell(), version))}`);
-    console.log(`  Run one command:        ${pc.bold(`lovs exec ${version} -- soffice --version`)}`);
-    console.log(`  Add to PATH:            ${pc.bold(`lovs path add ${version}`)}`);
+    const hints = await hintsFor(inst, config);
+    if (hints) {
+      console.log(`\n  Use it in this shell:   ${pc.bold(hints.env)}`);
+      console.log(`  Run one command:        ${pc.bold(hints.exec('soffice --version'))}`);
+      console.log(`  Add to PATH:            ${pc.bold(hints.pathAdd)}`);
+    }
   } finally {
     bar.done();
     process.removeListener('SIGINT', onSigint);
@@ -205,7 +229,8 @@ async function cmdPathAdd(spec, opts) {
   for (const r of res.removed) console.log(pc.dim(`  removed ${r}`));
   for (const h of res.hooks) console.log(pc.dim(`  hooked into ${h}`));
   printWarnings(res.warnings);
-  console.log(pc.dim(`\nOpen a new terminal for the change to apply. For this shell: ${evalHint(detectShell(), inst.version ?? spec)}`));
+  const hints = await hintsFor(inst, config);
+  console.log(pc.dim(`\nOpen a new terminal for the change to apply. For this shell: ${hints?.env ?? NO_HINT}`));
 }
 
 async function cmdPathRemove(spec, opts) {
@@ -232,8 +257,9 @@ async function cmdEnv(spec, opts) {
   for (const [shell, cmd] of Object.entries(envCommands(inst.programDir))) {
     console.log(`  ${pc.dim(shell.padEnd(10))} ${cmd}`);
   }
-  console.log(`\n  ${pc.dim('one-liner'.padEnd(10))} ${evalHint(detectShell(), spec)}`);
-  console.log(`  ${pc.dim('one command'.padEnd(10))} lovs exec ${spec} -- soffice --headless --convert-to pdf file.docx`);
+  const hints = await hintsFor(inst, config);
+  console.log(`\n  ${pc.dim('one-liner'.padEnd(10))} ${hints?.env ?? NO_HINT}`);
+  if (hints) console.log(`  ${pc.dim('one command'.padEnd(10))} ${hints.exec('soffice --headless --convert-to pdf file.docx')}`);
 }
 
 function envWith(programDir, version) {
@@ -264,12 +290,30 @@ async function cmdShell(spec, opts) {
   const config = loadConfig();
   const inst = await resolveInstall(config, spec);
   const shell = opts.shell ?? detectShell();
-  const env = envWith(inst.programDir, inst.version);
-  const exe =
-    shell === 'powershell' ? 'powershell.exe' : shell === 'cmd' ? process.env.ComSpec || 'cmd.exe' : shell === 'fish' ? 'fish' : process.env.SHELL || 'bash';
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lovs-shell-'));
+  const cleanup = () => fs.rmSync(tmpDir, { recursive: true, force: true });
+  let plan;
+  try {
+    plan = subshellPlan(shell, inst.programDir, { tmpDir });
+    for (const [file, content] of Object.entries(plan.files)) fs.writeFileSync(file, content);
+  } catch (err) {
+    cleanup();
+    throw err;
+  }
+  // PATH is also prepended up front for anything the shell runs before its
+  // start-up files; the plan re-applies it after them so it stays first.
+  const env = { ...envWith(inst.programDir, inst.version), ...plan.env };
   info(`Starting ${shell} with LibreOffice ${pc.bold(inst.version)} first on PATH. Type ${pc.bold('exit')} to leave.`);
-  const child = spawn(exe, shell === 'powershell' ? ['-NoLogo'] : [], { stdio: 'inherit', env });
-  child.on('exit', (code) => process.exit(code ?? 0));
+  const child = spawn(plan.command, plan.args, { stdio: 'inherit', env, windowsVerbatimArguments: plan.verbatim });
+  child.on('error', (err) => {
+    cleanup();
+    console.error(pc.red(`Could not start ${plan.command}: ${err.message}`));
+    process.exit(127);
+  });
+  child.on('exit', (code) => {
+    cleanup();
+    process.exit(code ?? 0);
+  });
 }
 
 async function cmdWhich() {

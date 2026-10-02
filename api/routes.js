@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { CONFIG_SCHEMA, loadConfig, lovsHome, saveConfig } from '../utils/config.js';
-import { envCommands, evalHint, shellsForPlatform } from '../utils/envcmd.js';
+import { envCommands, evalHint, shellArg, shellsForPlatform } from '../utils/envcmd.js';
 import { defaultMethod, findSevenZip, installVersion, resolveDownloader, uninstallInstall } from '../utils/install.js';
 import { scanLocalInstalls } from '../utils/local.js';
 import { addToPath, getPathStatus, pathFlagsFor, removeFromPath } from '../utils/pathenv.js';
@@ -146,7 +146,9 @@ export function createRoutes({ jobs, appVersion }) {
       '/api/env/:id',
       async ({ params }) => {
         const inst = await findInstall(params.id);
-        const spec = inst.version ?? inst.root;
+        // The id selects exactly this install (a version number can match
+        // several copies, e.g. MSI and portable) and never needs quoting.
+        const spec = inst.id;
         const shells = shellsForPlatform();
         return {
           version: inst.version,
@@ -155,7 +157,7 @@ export function createRoutes({ jobs, appVersion }) {
           evalHints: Object.fromEntries(shells.map((s) => [s, evalHint(s, spec)])),
           exec: `lovs exec ${spec} -- soffice --headless --convert-to pdf document.docx`,
           shell: `lovs shell ${spec}`,
-          sudoPathAdd: isWindows ? null : `sudo lovs path add "${inst.root}" --scope machine`,
+          sudoPathAdd: isWindows ? null : `sudo lovs path add ${shellArg('bash', inst.root)} --scope machine`,
         };
       },
     ],
@@ -194,7 +196,13 @@ export function matchRoute(routes, method, pathname) {
     const params = {};
     let ok = true;
     for (let i = 0; i < pp.length; i++) {
-      if (pp[i].startsWith(':')) params[pp[i].slice(1)] = decodeURIComponent(sp[i]);
+      if (pp[i].startsWith(':')) {
+        try {
+          params[pp[i].slice(1)] = decodeURIComponent(sp[i]);
+        } catch {
+          throw new HttpError(400, 'Malformed URL');
+        }
+      }
       else if (pp[i] !== sp[i]) {
         ok = false;
         break;

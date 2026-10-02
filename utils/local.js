@@ -43,6 +43,59 @@ export function isInside(child, parent) {
   return c === p || c.startsWith(p + path.sep);
 }
 
+/** Path with every symlink/junction resolved, or null when it doesn't exist. */
+export function realPath(p) {
+  try {
+    return fs.realpathSync.native(p);
+  } catch {
+    return null;
+  }
+}
+
+/** Ownership marker written by lovs after a successful install. */
+export function readMetadata(root) {
+  const meta = readJson(path.join(root, METADATA_FILE));
+  return meta && typeof meta.method === 'string' && typeof meta.version === 'string' ? meta : null;
+}
+
+/** UserInstallation from program/bootstrap.ini (Windows) or bootstraprc (Linux). */
+export function readUserInstallation(programDir) {
+  for (const f of ['bootstrap.ini', 'bootstraprc']) {
+    const file = path.join(programDir, f);
+    if (fs.existsSync(file)) return readIni(file).UserInstallation ?? null;
+  }
+  return null;
+}
+
+/**
+ * True when the profile lives next to the install ($ORIGIN-relative) rather
+ * than in the shared %APPDATA% / ~/.config location.
+ */
+export function hasIsolatedProfile(programDir) {
+  return /^\$ORIGIN(\/|$)/.test(readUserInstallation(programDir) ?? '');
+}
+
+/**
+ * The folder lovs created for this install (its real path, links resolved),
+ * or null when lovs doesn't own it. Owned means: lovs metadata at `root`,
+ * and the install's top folder (the portable folder, or `root` itself) is
+ * really a direct child of the install folder with `root` inside it. This
+ * is the only folder uninstall/reinstall will ever delete.
+ */
+export function ownedInstallDir(root, installDir) {
+  if (!installDir || !readMetadata(root)) return null;
+  const realTop = realPath(portableRootOf(root) ?? root);
+  const realInstallDir = realPath(installDir);
+  const realRoot = realPath(root);
+  if (!realTop || !realInstallDir || !realRoot) return null;
+  if (normalizePath(path.dirname(realTop)) !== normalizePath(realInstallDir)) return null;
+  return isInside(realRoot, realTop) ? realTop : null;
+}
+
+export function isOwnedInstall(root, installDir) {
+  return ownedInstallDir(root, installDir) !== null;
+}
+
 function findInstallRoots(dir, depth, out) {
   if (isProgramDir(path.join(dir, 'program'))) {
     out.push(dir);
@@ -167,9 +220,14 @@ async function probeVersions(installs) {
   }
 }
 
-function describeInstall(root, source) {
+function describeInstall(root, source, installDir) {
   const programDir = path.join(root, 'program');
-  const meta = readJson(path.join(root, METADATA_FILE));
+  const meta = readMetadata(root);
+  // Only installs lovs created count as managed; anything else found in the
+  // install folder is treated like a scan-folder install (never deleted).
+  const owned = isOwnedInstall(root, installDir);
+  if (source === 'managed' && !owned) source = 'scanned';
+  else if (owned) source = 'managed';
   const portableRoot = portableRootOf(root);
   let version = null;
   let versionSource = null;
@@ -208,7 +266,7 @@ function describeInstall(root, source) {
     kind: meta?.method ?? (portableRoot ? 'portable' : source === 'system' ? 'system' : 'extracted'),
     source,
     managed: source === 'managed',
-    isolatedProfile: meta?.isolatedProfile ?? Boolean(portableRoot),
+    isolatedProfile: hasIsolatedProfile(programDir),
     installedAt: meta?.installedAt ?? null,
   };
 }
@@ -253,9 +311,7 @@ export async function scanLocalInstalls(config, { probe = true } = {}) {
       }
       if (seen.has(key)) continue;
       seen.add(key);
-      // A scan folder may sit inside the install folder or vice versa.
-      const src = isInside(root, config.installDir) ? 'managed' : source;
-      installs.push(describeInstall(root, src));
+      installs.push(describeInstall(root, source, config.installDir));
     }
   }
 
@@ -284,7 +340,7 @@ export function installFromPath(p, config) {
   else if (isProgramDir(abs)) root = path.dirname(abs);
   else if (isProgramDir(path.join(abs, 'App', 'libreoffice', 'program'))) root = path.join(abs, 'App', 'libreoffice');
   if (!root) return null;
-  const inst = describeInstall(root, config && isInside(root, config.installDir) ? 'managed' : 'scanned');
+  const inst = describeInstall(root, 'scanned', config?.installDir);
   if (!inst.version) {
     inst.version = versionFromPath(root);
     if (inst.version) inst.versionSource = 'folder name';
@@ -326,6 +382,24 @@ export function resolveLocal(installs, spec) {
     throw new Error(`"${spec}" matches several installs of ${best.version}; use an id or path:\n${list}`);
   }
   return best;
+}
+
+/**
+ * The argument that makes resolveInstall() pick exactly `inst` again, given
+ * the same scan result: its version when that is unambiguous, its id when
+ * the scan finds it, otherwise its absolute folder (an install given by path
+ * that no scan folder covers). Raw text: quote it for the target shell.
+ */
+export function selectorFor(inst, installs) {
+  if (inst.version) {
+    try {
+      if (resolveLocal(installs, inst.version).id === inst.id) return inst.version;
+    } catch {
+      // ambiguous, or the scan doesn't know this install
+    }
+  }
+  if (installs.some((i) => i.id === inst.id)) return inst.id;
+  return path.resolve(inst.portableRoot ?? inst.root);
 }
 
 /** Scan, then resolve `spec`; falls back to treating `spec` as a folder path. */

@@ -3,7 +3,9 @@
 import { spawn } from 'node:child_process';
 
 const procs = [
-  spawn(process.execPath, ['--watch-path=api', '--watch-path=utils', '--watch-path=cli', 'index.js', 'ui', '--port', '5178', '--no-open'], {
+  // --watch restarts on changes to any module index.js loads (api/, cli/,
+  // utils/). Not --watch-path: Node only supports that on Windows and macOS.
+  spawn(process.execPath, ['--watch', 'index.js', 'ui', '--port', '5178', '--no-open'], {
     stdio: 'inherit',
   }),
   spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--open'], { stdio: 'inherit' }),

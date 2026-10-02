@@ -9,6 +9,11 @@ import { isWindows } from './platform.js';
  */
 export function run(command, args = [], { cwd, signal, verbatim = false, input, env } = {}) {
   return new Promise((resolve, reject) => {
+    // Never start an installer for an install that is already cancelled.
+    if (signal?.aborted) {
+      reject(signal.reason ?? Object.assign(new Error('Cancelled'), { name: 'AbortError' }));
+      return;
+    }
     const child = spawn(command, args, {
       cwd,
       env,

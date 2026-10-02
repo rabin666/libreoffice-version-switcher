@@ -60,14 +60,22 @@ async function readBody(req) {
 }
 
 function serveStatic(uiDir, pathname, res) {
+  let rel;
+  try {
+    rel = decodeURIComponent(pathname).replace(/^\/+/, '');
+  } catch {
+    throw new HttpError(400, 'Malformed URL');
+  }
+  if (rel.includes('\0')) throw new HttpError(400, 'Malformed URL');
   if (!uiDir) {
     res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Web UI is not built. Run "npm run build:ui" (or use "npm run dev").');
     return;
   }
-  let rel = decodeURIComponent(pathname).replace(/^\/+/, '');
   let file = path.join(uiDir, rel);
-  if (!file.startsWith(uiDir) || !rel || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+  const inside = path.relative(uiDir, file);
+  const escapes = inside.startsWith('..') || path.isAbsolute(inside);
+  if (escapes || !rel || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
     rel = 'index.html'; // SPA fallback
     file = path.join(uiDir, rel);
   }
@@ -118,7 +126,7 @@ export async function startServer({ port = 5178, host = '127.0.0.1', open = true
   jobs.on('update', (job) => broadcast('job', job));
   jobs.on('removed', (id) => broadcast('job-removed', { id }));
 
-  const server = http.createServer(async (req, res) => {
+  const handle = async (req, res) => {
     const hostHeader = String(req.headers.host ?? '').toLowerCase();
     const okHosts = [`127.0.0.1:${actualPort}`, `localhost:${actualPort}`, `[::1]:${actualPort}`];
     if (host !== '127.0.0.1' && host !== 'localhost') okHosts.push(`${host}:${actualPort}`);
@@ -127,7 +135,12 @@ export async function startServer({ port = 5178, host = '127.0.0.1', open = true
       return;
     }
 
-    const url = new URL(req.url, 'http://localhost');
+    let url;
+    try {
+      url = new URL(req.url, 'http://localhost');
+    } catch {
+      throw new HttpError(400, 'Malformed URL');
+    }
     const { pathname } = url;
     if (!pathname.startsWith('/api/')) {
       if (req.method !== 'GET' && req.method !== 'HEAD') return void res.writeHead(405).end();
@@ -162,11 +175,24 @@ export async function startServer({ port = 5178, host = '127.0.0.1', open = true
       if (status === 500) console.error(pc.red(`[api] ${req.method} ${pathname}: ${err.stack ?? err}`));
       sendJson(res, status, { error: err.message ?? String(err) });
     }
+  };
+
+  // One error boundary for everything (static files included): a bad
+  // request must never take the server down.
+  const server = http.createServer((req, res) => {
+    handle(req, res).catch((err) => {
+      const status = err.status ?? 500;
+      if (status === 500) console.error(pc.red(`[http] ${req.method} ${req.url}: ${err.stack ?? err}`));
+      if (res.headersSent) return void res.destroy();
+      res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(status === 500 ? 'Internal server error' : err.message);
+    });
   });
 
   for (let attempt = 0; ; attempt++) {
     try {
       await listen(server, actualPort, host);
+      actualPort = server.address().port; // resolves port 0
       break;
     } catch (err) {
       if (err.code !== 'EADDRINUSE' || attempt >= 10) throw err;

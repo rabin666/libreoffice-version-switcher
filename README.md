@@ -35,8 +35,8 @@ lovs ui                      # web interface at http://127.0.0.1:5178
 | `lovs ls [--json] [--no-probe]` | Installed versions with where they are and whether they're on PATH |
 | `lovs remote [filter] [--all] [--pre] [--refresh]` | Versions in the archive, grouped by series. `filter` like `7.6` or `24.8.7` |
 | `lovs remote info <version>` | Downloadable packages of a version for this platform, with sizes |
-| `lovs install <version> [-m method] [-d builtin\|xdm] [--force] [--keep-download]` | Download + install. `<version>` may be exact (`7.6.7.2`), a prefix (`7.6` = newest 7.6.x) or `latest` |
-| `lovs uninstall <version> [--yes]` | Delete a version lovs installed (scanned/system installs are never touched) |
+| `lovs install <version> [-m method] [-d builtin\|xdm] [--force] [--keep-download]` | Download + install. `<version>` may be exact (`7.6.7.2`), a prefix (`7.6` = newest 7.6.x) or `latest`. `--force` reinstalls: only a copy lovs created is replaced, only once the new one is ready, and its profile is kept |
+| `lovs uninstall <version> [--yes]` | Delete a version lovs installed: it must have lovs' `.lovs.json` marker and really (links resolved) sit directly in `installDir`. Anything else is never touched |
 | `lovs path status` | LibreOffice entries in user/machine PATH and which `soffice` wins |
 | `lovs path add <version> [--scope user\|machine] [--keep-others]` | Put a version first on the persistent PATH. Other LibreOffice entries in that scope are removed unless `--keep-others` |
 | `lovs path remove [version] [--scope user\|machine]` | Remove one version, or every LibreOffice entry, from PATH |
@@ -90,7 +90,7 @@ Nothing is registered with the OS, so any number of versions can coexist. Each l
 | RHEL / Oracle Linux | `rpm` (default) | Official rpm tarball, unpacked with `rpm2cpio \| cpio`. Needs both tools (`sudo dnf install cpio`). The `deb` method also works there |
 
 - Downloads are checked against the archive's published SHA-256.
-- **Separate profile per version** (`isolateProfile`, on by default): MSI/deb/rpm installs keep their user profile in `<install>/user-profile` instead of sharing `%APPDATA%\LibreOffice` / `~/.config/libreoffice`, so switching versions never corrupts a profile. Portable builds always have their own.
+- **Separate profile per version** (`isolateProfile`, on by default): MSI/deb/rpm installs keep their user profile in `<install>/user-profile` instead of sharing `%APPDATA%\LibreOffice` / `~/.config/libreoffice`, so switching versions never corrupts a profile. Portable installs get `UserInstallation` set to `<portable>/Data/settings` (the launcher's location) explicitly, because PATH and `lovs exec` run the inner `soffice` without the PortableApps launcher. The "own profile" flag shown for any install is read from its actual `bootstrap.ini`/`bootstraprc`.
 - Linux builds still need the usual system libraries. If `soffice` fails to start, installing the distro's `libreoffice` package once pulls them in.
 - Windows Installer needs free space on the system drive (C:) even when installing elsewhere.
 

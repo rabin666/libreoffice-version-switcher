@@ -7,12 +7,21 @@
 //  deb/rpm   Linux. Packages from the official tarball are unpacked (not
 //            installed) so no root is needed; the result lives in one folder.
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import * as tar from 'tar';
 import { hashFile, downloadFile, probe } from './download.js';
-import { METADATA_FILE, findInstallRootsIn, installFromPath, isInside } from './local.js';
+import {
+  METADATA_FILE,
+  findInstallRootsIn,
+  hasIsolatedProfile,
+  installFromPath,
+  ownedInstallDir,
+  readMetadata,
+  realPath,
+} from './local.js';
 import { getPathStatus, pathFlagsFor, removeFromPath } from './pathenv.js';
 import { detectPlatform, installMethods, isWindows } from './platform.js';
 import { findOnPath, run } from './proc.js';
@@ -198,24 +207,220 @@ async function installLinux(tarball, stage, method, { signal, onLog }) {
   await fsp.rm(unpacked, { recursive: true, force: true });
 }
 
+// Where each kind of install keeps its profile (UserInstallation, relative
+// to the program folder) and which folders to carry over on reinstall
+// (relative to the install's top folder).
+const PROFILE = {
+  standard: { userInstallation: '$ORIGIN/../user-profile', keep: ['user-profile'] },
+  // Same location the PortableApps launcher uses: <portable>/Data/settings.
+  portable: { userInstallation: '$ORIGIN/../../../Data/settings', keep: ['Data'] },
+};
+
+/** Set UserInstallation in program/bootstrap.ini (Windows) or bootstraprc (Linux). */
+export function setUserInstallation(root, value) {
+  const program = path.join(root, 'program');
+  const file = ['bootstrap.ini', 'bootstraprc'].map((f) => path.join(program, f)).find((f) => fs.existsSync(f));
+  if (!file) throw new Error(`No bootstrap.ini/bootstraprc in ${program}`);
+  const text = fs.readFileSync(file, 'utf8');
+  const line = `UserInstallation=${value}`;
+  let next;
+  if (/^UserInstallation=.*$/m.test(text)) next = text.replace(/^UserInstallation=.*$/m, line);
+  else if (/^\[Bootstrap\][ \t]*$/m.test(text)) next = text.replace(/^\[Bootstrap\][ \t]*$/m, (m) => `${m}\n${line}`);
+  else next = `[Bootstrap]\n${line}\n${text}`;
+  fs.writeFileSync(file, next);
+}
+
 /** Point the profile at <install>/user-profile instead of the shared one. */
 export function isolateProfile(root) {
-  const file = path.join(root, 'program', isWindows ? 'bootstrap.ini' : 'bootstraprc');
-  const text = fs.readFileSync(file, 'utf8');
-  const line = 'UserInstallation=$ORIGIN/../user-profile';
-  const next = /^UserInstallation=.*$/m.test(text)
-    ? text.replace(/^UserInstallation=.*$/m, line)
-    : text.replace(/^\[Bootstrap\]\s*$/m, (m) => `${m}\n${line}`);
-  fs.writeFileSync(file, next);
+  setUserInstallation(root, PROFILE.standard.userInstallation);
+}
+
+/**
+ * Put `stagedDir` at `targetDir`. An existing install there is moved aside
+ * first and only deleted once the new one is in place; its profile folders
+ * (`keep`) are carried over. On any failure the old install is restored.
+ */
+export async function commitInstall(stagedDir, targetDir, { keep = [], signal, onLog, assertReplaceable } = {}) {
+  signal?.throwIfAborted();
+  if (!fs.existsSync(targetDir)) {
+    await moveDir(stagedDir, targetDir);
+    return { replaced: false };
+  }
+  // Re-checked here, not just before downloading: the folder may have
+  // appeared (or changed owner) while the download was running.
+  if (!assertReplaceable) throw new Error(`${targetDir} already exists`);
+  assertReplaceable();
+
+  // Dot-prefixed so scans never list it as another install.
+  const backup = path.join(path.dirname(targetDir), `.lovs-old-${path.basename(targetDir)}-${Date.now()}`);
+  try {
+    await moveDir(targetDir, backup);
+  } catch (err) {
+    throw new Error(`Could not replace ${targetDir} (is this LibreOffice version still running?): ${err.message}`);
+  }
+  const carried = [];
+  try {
+    await moveDir(stagedDir, targetDir);
+    for (const rel of keep) {
+      const from = path.join(backup, rel);
+      if (!fs.existsSync(from)) continue;
+      const to = path.join(targetDir, rel);
+      await fsp.rm(to, { recursive: true, force: true });
+      await fsp.mkdir(path.dirname(to), { recursive: true });
+      await moveDir(from, to);
+      carried.push(rel);
+    }
+  } catch (err) {
+    try {
+      for (const rel of carried) await moveDir(path.join(targetDir, rel), path.join(backup, rel));
+      await fsp.rm(targetDir, { recursive: true, force: true });
+      await moveDir(backup, targetDir);
+      onLog?.('Reinstall failed; the previous installation was restored');
+    } catch (rollbackErr) {
+      err.message += ` (restoring the previous install failed; it is at ${backup}: ${rollbackErr.message})`;
+    }
+    throw err;
+  }
+  if (carried.length) onLog?.(`Kept the existing profile (${carried.join(', ')})`);
+  await fsp.rm(backup, { recursive: true, force: true }).catch(() => onLog?.(`Could not delete ${backup}; remove it manually`));
+  return { replaced: true };
 }
 
 // ------------------------------------------------------------- public API
 
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+// A lock (or stale-lock breaker) that holds no readable owner is assumed to
+// be still being written, until it is older than this.
+const LOCK_GRACE_MS = 30_000;
+
+function readLock(file) {
+  let text;
+  let mtimeMs;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+    mtimeMs = fs.statSync(file).mtimeMs;
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+  let owner = null;
+  try {
+    const parsed = JSON.parse(text);
+    if (Number.isInteger(parsed?.pid)) owner = parsed;
+  } catch {
+    // empty or partly written
+  }
+  return { text, owner, age: Date.now() - mtimeMs };
+}
+
+const isAbandoned = (lock) =>
+  lock.owner ? lock.owner.pid !== process.pid && !pidAlive(lock.owner.pid) : lock.age > LOCK_GRACE_MS;
+
+/**
+ * Create `file` holding `content`, or return false if it already exists.
+ * The file appears with its content in one step (hard link of a finished
+ * temp file), so no other process can ever see it empty.
+ */
+function createExclusive(file, content) {
+  const tmp = `${file}.${process.pid}-${crypto.randomBytes(6).toString('hex')}.tmp`;
+  fs.writeFileSync(tmp, content, { flag: 'wx' });
+  try {
+    fs.linkSync(tmp, file);
+    return true;
+  } catch (err) {
+    if (err.code === 'EEXIST') return false;
+    // No hard links here (FAT/exFAT, some network shares): plain exclusive
+    // create. Readers treat the brief empty state as "being written".
+    try {
+      fs.writeFileSync(file, content, { flag: 'wx' });
+      return true;
+    } catch (err2) {
+      if (err2.code === 'EEXIST') return false;
+      throw err2;
+    }
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
+/**
+ * Remove `file` only if it still holds `staleText`. Breakers serialize on
+ * `<file>.break` and re-read under it, so a lock created after the stale one
+ * was observed is never removed.
+ */
+function breakStaleLock(file, staleText) {
+  const breaker = `${file}.break`;
+  if (!createExclusive(breaker, JSON.stringify({ pid: process.pid, at: Date.now() }))) {
+    const other = readLock(breaker);
+    // A breaker holds its lock for microseconds; one that is old or whose
+    // process is gone crashed mid-way.
+    if (other && (other.age > LOCK_GRACE_MS || (other.owner && !pidAlive(other.owner.pid)))) fs.rmSync(breaker, { force: true });
+    return;
+  }
+  try {
+    if (readLock(file)?.text === staleText) fs.rmSync(file, { force: true });
+  } finally {
+    fs.rmSync(breaker, { force: true });
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Exclusive lock on one install folder, shared by every lovs process (CLI
+ * and web UI) and by install and uninstall. A lock left by a process that
+ * no longer runs is taken over. Returns the release function.
+ */
+export async function acquireInstallLock(installDir, name) {
+  await fsp.mkdir(installDir, { recursive: true });
+  const file = path.join(installDir, `.lovs-lock-${name}`);
+  const mine = JSON.stringify({ pid: process.pid, token: crypto.randomBytes(8).toString('hex'), at: new Date().toISOString() });
+  for (let attempt = 0; attempt < 50; attempt++) {
+    if (createExclusive(file, mine)) {
+      return () => {
+        // Only remove the lock if it is still ours.
+        if (readLock(file)?.text === mine) fs.rmSync(file, { force: true });
+      };
+    }
+    const held = readLock(file);
+    if (!held) continue; // released in the meantime
+    if (!isAbandoned(held)) {
+      const who = held.owner?.pid === process.pid ? 'this lovs process' : held.owner ? `another lovs process (pid ${held.owner.pid})` : 'another lovs process';
+      throw new Error(`${name} is busy: ${who} is installing or uninstalling it. Wait for it to finish (or delete ${file} if no lovs is running).`);
+    }
+    breakStaleLock(file, held.text);
+    await sleep(20 + Math.random() * 80);
+  }
+  throw new Error(`Could not lock ${file}`);
+}
+
 /**
  * Install `version` with `method` (default per platform/config).
  * Callbacks: onPhase(phase, detail), onProgress({downloaded,total,speed}), onLog(msg).
+ *
+ * With `force`, an existing install of the same version/method is only
+ * replaced after the new one has been downloaded, unpacked and configured.
+ * The target is locked for the whole install.
  */
-export async function installVersion({ version, method, config, downloader, force = false, signal, onPhase, onProgress, onLog }) {
+export async function installVersion(opts) {
+  const method = opts.method || defaultMethod(opts.config);
+  const release = await acquireInstallLock(opts.config.installDir, targetDirName(opts.version, method));
+  try {
+    return await installUnlocked({ ...opts, method });
+  } finally {
+    release();
+  }
+}
+
+async function installUnlocked({ version, method, config, downloader, force = false, signal, onPhase, onProgress, onLog }) {
   const platform = detectPlatform();
   if (!platform.supported) throw new Error(`Installing is not supported on ${platform.pretty} (${platform.arch})`);
 
@@ -230,11 +435,13 @@ export async function installVersion({ version, method, config, downloader, forc
   }
 
   const targetDir = path.join(config.installDir, targetDirName(version, method));
-  if (fs.existsSync(targetDir)) {
+  const assertReplaceable = () => {
     if (!force) throw new Error(`${version} (${method}) is already installed at ${targetDir}. Use --force to reinstall.`);
-    onLog?.(`Removing existing ${targetDir}`);
-    await fsp.rm(targetDir, { recursive: true, force: true });
-  }
+    // --force only ever replaces a folder lovs created itself.
+    const existingRoot = method === 'portable' ? path.join(targetDir, 'App', 'libreoffice') : targetDir;
+    if (!ownedInstallDir(existingRoot, config.installDir)) throw notOwnedError(targetDir, existingRoot, config, 'Not replacing');
+  };
+  if (fs.existsSync(targetDir)) assertReplaceable();
 
   await fsp.mkdir(config.installDir, { recursive: true });
   await fsp.mkdir(config.downloadDir, { recursive: true });
@@ -277,62 +484,90 @@ export async function installVersion({ version, method, config, downloader, forc
     if (res.reused) onLog?.('Re-using previously downloaded file');
   }
   if (!sha256) onLog?.('No published SHA-256 found; checked size only');
+  signal?.throwIfAborted();
 
   onPhase?.('extract', `Installing (${method})`);
   const stage = path.join(config.installDir, `.staging-${version}-${Date.now()}`);
+  const portable = method === 'portable';
   try {
     if (method === 'msi') await installMsi(file, stage, { signal, onLog });
-    else if (method === 'portable') await installPortable(file, stage, { config, signal, onLog });
+    else if (portable) await installPortable(file, stage, { config, signal, onLog });
     else await installLinux(file, stage, method, { signal, onLog });
+    signal?.throwIfAborted();
 
     const [root] = findInstallRootsIn(stage);
     if (!root) throw new Error('Installation finished but no program/soffice was found in the result');
+
+    // Configure inside the staging folder so the committed install is complete.
+    onPhase?.('configure', 'Configuring');
+    if (portable) {
+      // PATH and `lovs exec` run the inner soffice directly, bypassing the
+      // PortableApps launcher, so the profile location must be set here.
+      setUserInstallation(root, PROFILE.portable.userInstallation);
+    } else if (config.isolateProfile) {
+      isolateProfile(root);
+    }
+    const isolated = hasIsolatedProfile(path.join(root, 'program'));
+    if ((portable || config.isolateProfile) && !isolated) throw new Error('Could not configure a separate user profile for this install');
+    fs.writeFileSync(
+      path.join(root, METADATA_FILE),
+      JSON.stringify(
+        { version, method, fileName: art.fileName, url: art.url, sha256, downloader: via, isolatedProfile: isolated, installedAt: new Date().toISOString() },
+        null,
+        2,
+      ),
+    );
+
     // Portable builds are moved as a whole (launchers + App + Data).
-    const moveFrom = method === 'portable' ? path.resolve(root, '..', '..') : root;
-    await moveDir(moveFrom, targetDir);
+    const moveFrom = portable ? path.resolve(root, '..', '..') : root;
+    await commitInstall(moveFrom, targetDir, { keep: PROFILE[portable ? 'portable' : 'standard'].keep, signal, onLog, assertReplaceable });
   } finally {
     await fsp.rm(stage, { recursive: true, force: true }).catch(() => {});
   }
-
-  onPhase?.('configure', 'Configuring');
-  const installRoot = method === 'portable' ? path.join(targetDir, 'App', 'libreoffice') : targetDir;
-  const isolated = method === 'portable' || config.isolateProfile;
-  if (method !== 'portable' && config.isolateProfile) isolateProfile(installRoot);
-  fs.writeFileSync(
-    path.join(installRoot, METADATA_FILE),
-    JSON.stringify(
-      { version, method, fileName: art.fileName, url: art.url, sha256, downloader: via, isolatedProfile: isolated, installedAt: new Date().toISOString() },
-      null,
-      2,
-    ),
-  );
 
   if (!config.keepDownloads) {
     await fsp.rm(downloadedDir ?? file, { recursive: true, force: true }).catch(() => {});
   }
   onPhase?.('done', `Installed ${version} to ${targetDir}`);
-  return installFromPath(installRoot, config);
+  return installFromPath(portable ? path.join(targetDir, 'App', 'libreoffice') : targetDir, config);
+}
+
+function notOwnedError(dir, root, config, action) {
+  const why = !readMetadata(root)
+    ? `it was not installed by lovs (no ${METADATA_FILE})`
+    : `its real location (${realPath(dir) ?? 'missing'}) is not directly inside the install folder (${realPath(config.installDir) ?? config.installDir})`;
+  return new Error(`${action} ${dir}: ${why}. Nothing was deleted.`);
 }
 
 /**
  * Delete a version that lovs installed, removing it from the user PATH first.
- * Installs found via scan folders or system locations are never deleted.
+ * Only folders lovs created are deleted: they must carry lovs metadata and
+ * really (links resolved) be a direct child of the install folder.
  */
 export async function uninstallInstall(install, config) {
-  if (!install.managed || !isInside(install.root, config.installDir)) {
-    throw new Error(`Only versions inside the install folder (${config.installDir}) can be uninstalled. ${install.root} was left untouched.`);
-  }
   const dir = install.portableRoot ?? install.root;
-  if (path.resolve(dir) === path.resolve(config.installDir)) throw new Error('Refusing to delete the install folder itself');
+  const owned = ownedInstallDir(install.root, config.installDir);
+  if (!owned) throw notOwnedError(dir, install.root, config, 'Not uninstalling');
 
-  const warnings = [];
+  // Same lock as install: never delete a folder while it is being
+  // (re)installed, e.g. between moving the old copy aside and committing.
+  const release = await acquireInstallLock(config.installDir, path.basename(owned));
   try {
-    const flags = pathFlagsFor(install, await getPathStatus());
-    if (flags.user) await removeFromPath({ scope: 'user', install });
-    if (flags.machine) warnings.push('It is still listed in the machine PATH; remove it with "lovs path remove --scope machine".');
-  } catch (err) {
-    warnings.push(`Could not update PATH: ${err.message}`);
+    // Re-check under the lock: the folder may have been replaced meanwhile.
+    const realDir = ownedInstallDir(install.root, config.installDir);
+    if (!realDir || realDir !== owned) throw notOwnedError(dir, install.root, config, 'Not uninstalling');
+
+    const warnings = [];
+    try {
+      const flags = pathFlagsFor(install, await getPathStatus());
+      if (flags.user) await removeFromPath({ scope: 'user', install });
+      if (flags.machine) warnings.push('It is still listed in the machine PATH; remove it with "lovs path remove --scope machine".');
+    } catch (err) {
+      warnings.push(`Could not update PATH: ${err.message}`);
+    }
+    await fsp.rm(realDir, { recursive: true, force: true });
+    return { removed: realDir, warnings };
+  } finally {
+    release();
   }
-  await fsp.rm(dir, { recursive: true, force: true });
-  return { removed: dir, warnings };
 }
